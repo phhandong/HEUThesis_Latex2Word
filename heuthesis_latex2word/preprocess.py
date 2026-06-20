@@ -6,6 +6,10 @@ from pathlib import Path
 from .latex_parser import ExpandedLatexProject, ThesisMetadata
 
 
+COVER_MARKER = "HEU_COVER_PLACEHOLDER"
+DECLARATION_MARKER = "HEU_DECLARATION_PLACEHOLDER"
+
+
 def _latex_escape(text: str) -> str:
     replacements = {
         "\\": r"\textbackslash{}",
@@ -118,7 +122,7 @@ def _neutralize_heu_macros(text: str, metadata: ThesisMetadata, include_auth_sca
     text = re.sub(r"\\graphicspath\s*\{(?:[^{}]|\{[^{}]*\})*\}", "", text, flags=re.S)
     text = re.sub(r"\\frontmatter|\\mainmatter|\\backmatter", "", text)
     text = re.sub(r"\\cleardoublepage|\\clearpage", r"\\newpage", text)
-    text = re.sub(r"\\makecover\b", lambda _m: build_cover_latex(metadata), text)
+    text = re.sub(r"\\makecover\b", COVER_MARKER, text)
     if include_auth_scan:
         auth = (
             r"\section*{学位论文原创性声明和授权使用声明}"
@@ -129,7 +133,7 @@ def _neutralize_heu_macros(text: str, metadata: ThesisMetadata, include_auth_sca
             + "\n\n\\newpage\n"
         )
     else:
-        auth = build_declaration_latex()
+        auth = DECLARATION_MARKER
     text = re.sub(r"\\authorization(?:\[[^\]]+\])?", lambda _m: auth, text)
     text = re.sub(r"\\makeabstract\b", lambda _m: build_abstract_latex(metadata), text)
     text = re.sub(r"\\tableofcontents\b", lambda _m: build_toc_latex(), text)
@@ -140,6 +144,18 @@ def _neutralize_heu_macros(text: str, metadata: ThesisMetadata, include_auth_sca
     text = re.sub(r"\\BiSubSection\{([^{}]+)\}\{([^{}]+)\}", r"\\subsection{\1}", text)
     text = re.sub(r"\\appendix\{([^{}]+)\}\{([^{}]+)\}(?:\[[^\]]*\])?", r"\\chapter*{附录 \1 \2}", text)
     text = re.sub(r"\\section\*\{本章小结\}(?:\[[^\]]*\])?", r"\\section*{本章小结}", text)
+    text = re.sub(r"\\begin\{conclusions\}", r"\\chapter*{结论}", text)
+    text = re.sub(r"\\end\{conclusions\}", "", text)
+    text = re.sub(
+        r"\\begin\{publication\}",
+        r"\\chapter*{攻读硕士学位期间发表的论文和取得的科研成果}",
+        text,
+    )
+    text = re.sub(r"\\end\{publication\}", "", text)
+    text = re.sub(r"\\begin\{acknowledgements\}", r"\\chapter*{致谢}", text)
+    text = re.sub(r"\\end\{acknowledgements\}", "", text)
+    text = re.sub(r"\\begin\{publist\}", r"\\begin{itemize}", text)
+    text = re.sub(r"\\end\{publist\}", r"\\end{itemize}", text)
     text = re.sub(r"\\(songti|heiti|kaishu|fangsong|xiaosi|wuhao|xiaoer|sanhao|sihao)(?:\[[^\]]*\])?", "", text)
     text = re.sub(r"\\cs\s+([A-Za-z]+)", r"\\textbackslash{}\1", text)
     return text

@@ -2,7 +2,11 @@ from pathlib import Path
 
 from heuthesis_latex2word.bibliography import collect_references
 from heuthesis_latex2word.latex_parser import expand_project, parse_heusetup
-from heuthesis_latex2word.preprocess import make_pandoc_latex
+from heuthesis_latex2word.preprocess import (
+    COVER_MARKER,
+    DECLARATION_MARKER,
+    make_pandoc_latex,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +32,9 @@ def test_expand_sample_project_metadata_and_paths():
     project = expand_project(SAMPLE, degree_override="master")
     assert project.metadata.author_cn == "马冬梅"
     assert project.metadata.degree_label == "工程硕士"
+    assert project.metadata.classified_index == "TM301.2"
+    assert project.metadata.udc == "62-5"
+    assert project.metadata.subject_en == "Power Engineering"
     assert "body\\chap01" not in project.latex
     assert "绪论" in project.latex
     assert any(path.name == "figures" for path in project.resource_paths)
@@ -38,8 +45,12 @@ def test_preprocess_neutralizes_heu_frontmatter():
     project = expand_project(SAMPLE, degree_override="doctor")
     latex = make_pandoc_latex(project)
     assert r"\usepackage{heuthesis}" not in latex
-    assert "专业学位博士学位论文" in latex
+    assert COVER_MARKER in latex
+    assert DECLARATION_MARKER in latex
     assert "HEU_TOC_PLACEHOLDER" in latex
+    assert r"\chapter*{结论}" in latex
+    assert r"\chapter*{攻读硕士学位期间发表的论文和取得的科研成果}" in latex
+    assert r"\chapter*{致谢}" in latex
     assert r"\includegraphics[scale=1.0]{install-texlive.jpg}" in latex
 
 

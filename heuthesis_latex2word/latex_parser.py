@@ -11,6 +11,10 @@ _COMMENT_SENTINEL = "\0PERCENT\0"
 @dataclass
 class ThesisMetadata:
     degree: str | None = None
+    state_secrets: str = ""
+    document_number: str = ""
+    classified_index: str = ""
+    udc: str = ""
     title_cn: str = ""
     title_cover_cn: str = ""
     title_en: str = ""
@@ -18,11 +22,18 @@ class ThesisMetadata:
     author_en: str = ""
     supervisor_cn: str = ""
     supervisor_en: str = ""
+    cosupervisor_cn: str = ""
+    cosupervisor_en: str = ""
     affiliation_cn: str = ""
+    affiliation_en: str = ""
     subject_cn: str = ""
+    subject_en: str = ""
     student_id: str = ""
     submit_date_cn: str = ""
+    submit_date_en: str = ""
     oral_date_cn: str = ""
+    oral_date_en: str = ""
+    student_type_en: str = ""
     keywords_cn: list[str] = field(default_factory=list)
     keywords_en: list[str] = field(default_factory=list)
     abstract_cn: str = ""
@@ -47,6 +58,20 @@ class ThesisMetadata:
         if self.degree == "doctor":
             return "专业学位博士学位论文"
         return "专业学位硕士学位论文"
+
+    @property
+    def student_label_cn(self) -> str:
+        if self.degree == "doctor":
+            return "博士研究生"
+        return "硕士研究生"
+
+    @property
+    def degree_label_en(self) -> str:
+        if self.student_type_en:
+            return self.student_type_en
+        if self.degree == "doctor":
+            return "Doctor of Engineering"
+        return "Master of Engineering"
 
 
 @dataclass
@@ -231,6 +256,10 @@ def _metadata_from_sources(
 
     metadata = ThesisMetadata(
         degree=degree,
+        state_secrets=value("statesecrets"),
+        document_number=value("cnumber"),
+        classified_index=value("natclassifiedindex"),
+        udc=value("intclassifiedindex"),
         title_cn=value("ctitle"),
         title_cover_cn=value("ctitlecover"),
         title_en=value("etitle"),
@@ -238,11 +267,18 @@ def _metadata_from_sources(
         author_en=value("eauthor"),
         supervisor_cn=value("csupervisor"),
         supervisor_en=value("esupervisor"),
+        cosupervisor_cn=value("ccosupervisor") or value("cassosupervisor"),
+        cosupervisor_en=value("ecosupervisor") or value("eassosupervisor"),
         affiliation_cn=value("caffil"),
+        affiliation_en=value("eaffil"),
         subject_cn=value("csubject"),
+        subject_en=value("esubject"),
         student_id=value("cstudentid"),
         submit_date_cn=value("csubmitdate") or value("cdate"),
+        submit_date_en=value("esubmitdate") or value("edate"),
         oral_date_cn=value("coralexdate"),
+        oral_date_en=value("eoralexdate"),
+        student_type_en=value("estudenttype"),
         keywords_cn=[latex_to_plain(x) for x in setup.get("ckeywords", "").split(",") if x.strip()],
         keywords_en=[latex_to_plain(x) for x in setup.get("ekeywords", "").split(",") if x.strip()],
         abstract_cn=extract_environment(cover_text, "cabstract"),

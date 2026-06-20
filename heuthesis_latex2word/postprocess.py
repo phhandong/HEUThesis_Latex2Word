@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from pathlib import Path
 
 from docx import Document
@@ -53,6 +54,30 @@ FRONT_MATTER_TITLES = {
 
 CAPTION_PREFIX_RE = re.compile(r"^[图表]\s*\d+(?:\.\d+)+")
 REFERENCE_ENTRY_RE = re.compile(r"^\[\d+\]")
+COVER_MARKER = "HEU_COVER_PLACEHOLDER"
+DECLARATION_MARKER = "HEU_DECLARATION_PLACEHOLDER"
+PUBLICATION_SECTION_TITLES = {
+    "（一）发表的相关论文",
+    "（二）申请及已获得的专利（无专利时此项不必列出）",
+    "（三）参与的科研项目及获奖情况",
+}
+PRIMARY_BACK_MATTER_TITLES = {
+    "结论",
+    "致谢",
+    "攻读硕士学位期间发表的论文和取得的科研成果",
+}
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _engineering_template_path(filename: str) -> Path:
+    return _repo_root() / "requirements" / "Engineering" / filename
+
+
+COVER_TEMPLATE_PATH = _engineering_template_path("封面.docx")
+DECLARATION_TEMPLATE_PATH = _engineering_template_path("5.学位论文原创性声明和授权使用声明(最新).docx")
 
 
 def _set_run_font(run, font_cn: str, font_en: str, size_pt: float, bold: bool | None = None) -> None:
@@ -153,6 +178,307 @@ def _add_field(paragraph, instruction: str) -> None:
 def _clear_paragraph(paragraph) -> None:
     for run in list(paragraph.runs):
         paragraph._p.remove(run._r)
+
+
+def _set_paragraph_text(paragraph, text: str) -> None:
+    if paragraph.runs:
+        paragraph.runs[0].text = text
+        for run in paragraph.runs[1:]:
+            run.text = ""
+    else:
+        paragraph.add_run(text)
+
+
+def _set_cell_text(cell, text: str) -> None:
+    para = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+    _set_paragraph_text(para, text)
+    for extra in cell.paragraphs[1:]:
+        _clear_paragraph(extra)
+
+
+def _element_text(element) -> str:
+    return "".join(node.text or "" for node in element.iter(qn("w:t")))
+
+
+def _section_properties_from_doc(doc: Document):
+    for child in reversed(list(doc._element.body)):
+        if child.tag == qn("w:sectPr"):
+            return child
+    return None
+
+
+def _set_section_start_type(sect_pr, section_type: str) -> None:
+    for old in list(sect_pr.findall(qn("w:type"))):
+        sect_pr.remove(old)
+    if section_type:
+        sect_type = OxmlElement("w:type")
+        sect_type.set(qn("w:val"), section_type)
+        sect_pr.insert(0, sect_type)
+
+
+def _strip_header_footer_references(element) -> None:
+    nodes = [element] if element.tag == qn("w:sectPr") else list(element.iter(qn("w:sectPr")))
+    for sect_pr in nodes:
+        for tag in ("w:headerReference", "w:footerReference"):
+            for ref in list(sect_pr.findall(qn(tag))):
+                sect_pr.remove(ref)
+
+
+def _section_break_paragraph(doc: Document, section_type: str = "nextPage"):
+    source = _section_properties_from_doc(doc)
+    sect_pr = deepcopy(source) if source is not None else OxmlElement("w:sectPr")
+    _strip_header_footer_references(sect_pr)
+    _set_section_start_type(sect_pr, section_type)
+    paragraph = OxmlElement("w:p")
+    ppr = OxmlElement("w:pPr")
+    paragraph.append(ppr)
+    ppr.append(sect_pr)
+    return paragraph
+
+
+def _page_break_paragraph():
+    paragraph = OxmlElement("w:p")
+    run = OxmlElement("w:r")
+    br = OxmlElement("w:br")
+    br.set(qn("w:type"), "page")
+    run.append(br)
+    paragraph.append(run)
+    return paragraph
+
+
+def _insert_element_before(paragraph, element) -> None:
+    parent = paragraph._p.getparent()
+    parent.insert(parent.index(paragraph._p), element)
+
+
+def _insert_section_break_before(paragraph, section_type: str = "nextPage") -> None:
+    parent_doc = paragraph._parent.part.document
+    _insert_element_before(paragraph, _section_break_paragraph(parent_doc, section_type))
+
+
+def _remove_paragraph(paragraph) -> None:
+    parent = paragraph._p.getparent()
+    parent.remove(paragraph._p)
+
+
+def _is_empty_section_break_paragraph(element) -> bool:
+    return element.tag == qn("w:p") and not _element_text(element).strip() and element.find(qn("w:pPr")) is not None and element.find(".//" + qn("w:sectPr")) is not None
+
+
+def _has_previous_section_break(paragraph) -> bool:
+    parent = paragraph._p.getparent()
+    index = parent.index(paragraph._p)
+    for previous in reversed(parent[:index]):
+        if previous.tag != qn("w:p"):
+            return False
+        if _element_text(previous).strip():
+            return False
+        if _is_empty_section_break_paragraph(previous):
+            return True
+    return False
+
+
+def _iter_all_paragraphs(doc: Document):
+    for para in doc.paragraphs:
+        yield para
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    yield para
+
+
+def _split_cover_title(title: str) -> list[str]:
+    lines = [part.strip() for part in re.split(r"[\r\n]+", title) if part.strip()]
+    return lines or [title.strip()] if title.strip() else [""]
+
+
+def _apply_cover_metadata(doc: Document, metadata: ThesisMetadata) -> None:
+    title_cn = metadata.display_title_cn
+    title_en_lines = _split_cover_title(metadata.title_en)
+    title_en_first = title_en_lines[0] if title_en_lines else ""
+    title_en_second = " ".join(title_en_lines[1:]) if len(title_en_lines) > 1 else ""
+    school = "哈尔滨工程大学"
+
+    for para in _iter_all_paragraphs(doc):
+        text = para.text.strip()
+        if not text:
+            continue
+        if text.startswith("分类号："):
+            _set_paragraph_text(
+                para,
+                f"分类号：{metadata.classified_index or ' '}"
+                f"                          密级：{metadata.state_secrets or ' '}",
+            )
+        elif text.startswith("U D C"):
+            _set_paragraph_text(
+                para,
+                f"U D C ：{metadata.udc or ' '}                          编号：{metadata.document_number or ' '}",
+            )
+        elif "专业学位硕士学位论文" in text or "专业学位博士学位论文" in text:
+            _set_paragraph_text(para, f"          {metadata.document_label}")
+        elif "基于FPGA的高能效XXX应用系统" in text:
+            _set_paragraph_text(para, title_cn)
+        elif text.startswith("硕士研究生：") or text.startswith("博士研究生："):
+            _set_paragraph_text(para, f"{metadata.student_label_cn}：{metadata.author_cn}")
+        elif text.startswith("指导教师："):
+            _set_paragraph_text(para, f"指导教师：{metadata.supervisor_cn}")
+        elif text.startswith("校外导师："):
+            _set_paragraph_text(para, f"校外导师：{metadata.cosupervisor_cn}")
+        elif "学 位 类 别" in text:
+            _set_paragraph_text(para, f"    学 位 类 别 ：{metadata.degree_label}")
+        elif text.startswith(school) and "楷体" in text:
+            _set_paragraph_text(para, school)
+        elif "20XX年X月" in text:
+            _set_paragraph_text(para, metadata.submit_date_cn)
+        elif text.startswith("Classified Index"):
+            _set_paragraph_text(para, f"Classified Index: {metadata.classified_index}")
+        elif text.startswith("U.D.C"):
+            _set_paragraph_text(para, f"U.D.C: {metadata.udc}")
+        elif text.startswith("A Thesis for the Degree of"):
+            _set_paragraph_text(para, f"A Thesis for the Degree of {metadata.degree_label_en}")
+        elif "An Energy Efficient FPGA-based System" in text:
+            _set_paragraph_text(para, title_en_first)
+        elif "for XXX Applications" in text:
+            _set_paragraph_text(para, title_en_second)
+
+    table_value_map = {
+        metadata.student_label_cn: metadata.author_cn,
+        "指导教师": metadata.supervisor_cn,
+        "校外导师": metadata.cosupervisor_cn,
+        "专业类别": metadata.subject_cn,
+        "所在学院": metadata.affiliation_cn,
+        "论文提交日期": metadata.submit_date_cn,
+        "论文答辩日期": metadata.oral_date_cn,
+        "学位授予单位": school,
+        "Candidate :": metadata.author_en,
+        "Supervisor :": metadata.supervisor_en,
+        "Associate Supervisor :": metadata.cosupervisor_en,
+        "Professional category :": metadata.subject_en,
+        "College :": metadata.affiliation_en,
+        "Date of Submission :": metadata.submit_date_en,
+        "Date of Oral Examination :": metadata.oral_date_en,
+        "University :": "Harbin Engineering University",
+    }
+    for table in doc.tables:
+        for row in table.rows:
+            cells = row.cells
+            if len(cells) < 2:
+                continue
+            label = cells[0].text.strip()
+            if label in table_value_map:
+                value = table_value_map[label]
+                prefix = "：" if "：" not in label and not label.endswith(":") else ""
+                _set_cell_text(cells[1], f"{prefix}{value}")
+
+
+def _insert_template_break_before(doc: Document, title: str, include_previous_school_line: bool = False) -> None:
+    paragraphs = list(doc.paragraphs)
+    for index, para in enumerate(paragraphs):
+        if para.text.strip() != title:
+            continue
+        target = para
+        if include_previous_school_line and index > 0 and paragraphs[index - 1].text.strip() == "哈尔滨工程大学":
+            target = paragraphs[index - 1]
+        _insert_element_before(target, _page_break_paragraph())
+        return
+
+
+def _prepare_template_doc(path: Path, metadata: ThesisMetadata, *, kind: str) -> Document | None:
+    if not path.exists():
+        return None
+    template = Document(path)
+    if kind == "cover":
+        _apply_cover_metadata(template, metadata)
+    elif kind == "declaration":
+        _insert_template_break_before(template, "学位论文授权使用声明", include_previous_school_line=True)
+    return template
+
+
+def _template_body_elements(template: Document, *, boundary_type: str | None = "nextPage") -> list:
+    body = template._element.body
+    elements = []
+    for child in body:
+        if child.tag == qn("w:sectPr"):
+            continue
+        copied = deepcopy(child)
+        _strip_header_footer_references(copied)
+        elements.append(copied)
+    if boundary_type == "page":
+        elements.append(_page_break_paragraph())
+    elif boundary_type:
+        final_break = _section_break_paragraph(template, boundary_type)
+        elements.append(final_break)
+    return elements
+
+
+def _insert_elements_before_paragraph(paragraph, elements: list) -> None:
+    parent = paragraph._p.getparent()
+    index = parent.index(paragraph._p)
+    for element in elements:
+        parent.insert(index, element)
+        index += 1
+
+
+def _is_followed_by_section_break(paragraph) -> bool:
+    parent = paragraph._p.getparent()
+    index = parent.index(paragraph._p)
+    for following in parent[index + 1 :]:
+        if _is_empty_section_break_paragraph(following):
+            return True
+        if following.tag == qn("w:p") and not _element_text(following).strip():
+            continue
+        return False
+    return False
+
+
+def _replace_marker_with_template(
+    doc: Document,
+    marker: str,
+    template_path: Path,
+    metadata: ThesisMetadata,
+    report: ConversionReport,
+    *,
+    kind: str,
+    note: str,
+) -> bool:
+    template = _prepare_template_doc(template_path, metadata, kind=kind)
+    if template is None:
+        report.warn(f"找不到 {note} 模板：{template_path}")
+        return False
+
+    for para in list(doc.paragraphs):
+        if para.text.strip() == marker:
+            if marker == DECLARATION_MARKER:
+                boundary_type = None
+            else:
+                boundary_type = None if _is_followed_by_section_break(para) else "page"
+            _insert_elements_before_paragraph(para, _template_body_elements(template, boundary_type=boundary_type))
+            _remove_paragraph(para)
+            report.note(f"已插入{note}：{template_path}")
+            return True
+    return False
+
+
+def _prepend_template(
+    doc: Document,
+    template_path: Path,
+    metadata: ThesisMetadata,
+    report: ConversionReport,
+    *,
+    kind: str,
+    note: str,
+) -> None:
+    template = _prepare_template_doc(template_path, metadata, kind=kind)
+    if template is None:
+        report.warn(f"找不到 {note} 模板：{template_path}")
+        return
+    body = doc._element.body
+    insert_at = 0
+    for element in _template_body_elements(template, boundary_type="page"):
+        body.insert(insert_at, element)
+        insert_at += 1
+    report.note(f"已插入{note}：{template_path}")
 
 
 def _format_sections(doc: Document) -> None:
@@ -312,6 +638,71 @@ def _paragraph_has_drawing(para) -> bool:
 
 def _paragraph_has_display_math(para) -> bool:
     return "<m:oMathPara" in para._element.xml
+
+
+def _wp_child(element, tag: str):
+    return element.find(qn(tag))
+
+
+def _convert_inline_to_top_bottom_anchor(inline) -> None:
+    anchor = OxmlElement("wp:anchor")
+    for attr, value in {
+        "distT": "0",
+        "distB": "0",
+        "distL": "114300",
+        "distR": "114300",
+        "simplePos": "0",
+        "relativeHeight": "251658240",
+        "behindDoc": "0",
+        "locked": "0",
+        "layoutInCell": "1",
+        "allowOverlap": "0",
+    }.items():
+        anchor.set(attr, value)
+
+    simple_pos = OxmlElement("wp:simplePos")
+    simple_pos.set("x", "0")
+    simple_pos.set("y", "0")
+    anchor.append(simple_pos)
+
+    position_h = OxmlElement("wp:positionH")
+    position_h.set("relativeFrom", "column")
+    align = OxmlElement("wp:align")
+    align.text = "center"
+    position_h.append(align)
+    anchor.append(position_h)
+
+    position_v = OxmlElement("wp:positionV")
+    position_v.set("relativeFrom", "paragraph")
+    pos_offset = OxmlElement("wp:posOffset")
+    pos_offset.text = "0"
+    position_v.append(pos_offset)
+    anchor.append(position_v)
+
+    for tag in ("wp:extent", "wp:effectExtent"):
+        child = _wp_child(inline, tag)
+        if child is not None:
+            anchor.append(deepcopy(child))
+
+    wrap = OxmlElement("wp:wrapTopAndBottom")
+    wrap.set("distT", "0")
+    wrap.set("distB", "0")
+    anchor.append(wrap)
+
+    for tag in ("wp:docPr", "wp:cNvGraphicFramePr", "a:graphic"):
+        child = _wp_child(inline, tag)
+        if child is not None:
+            anchor.append(deepcopy(child))
+
+    inline.getparent().replace(inline, anchor)
+
+
+def _convert_images_to_top_bottom_wrap(doc: Document, report: ConversionReport | None = None) -> None:
+    inlines = list(doc._element.iter(qn("wp:inline")))
+    for inline in inlines:
+        _convert_inline_to_top_bottom_anchor(inline)
+    if report and inlines:
+        report.note(f"已将 {len(inlines)} 张图片设置为上下型环绕。")
 
 
 def _replace_text(para, text: str) -> None:
@@ -498,6 +889,55 @@ def _format_paragraphs(doc: Document, report: ConversionReport | None = None) ->
         report.note(f"已按章补全题注编号：图 {numbered_figures} 个，表 {numbered_tables} 个。")
 
 
+def _has_meaningful_content_before(paragraph) -> bool:
+    parent = paragraph._p.getparent()
+    index = parent.index(paragraph._p)
+    for previous in parent[:index]:
+        if previous.tag == qn("w:tbl"):
+            return True
+        if previous.tag == qn("w:p") and (
+            _element_text(previous).strip()
+            or previous.find(".//" + qn("w:drawing")) is not None
+            or previous.find(".//" + qn("w:br")) is not None
+        ):
+            return True
+    return False
+
+
+def _is_primary_page_heading(para) -> bool:
+    text = para.text.strip()
+    style_name = para.style.name if para.style else ""
+    return (
+        style_name.startswith("Heading 1")
+        or text in FRONT_MATTER_TITLES
+        or text in PRIMARY_BACK_MATTER_TITLES
+    )
+
+
+def _insert_page_section_breaks(doc: Document, report: ConversionReport | None = None) -> None:
+    odd_breaks = 0
+    normal_breaks = 0
+
+    for para in list(doc.paragraphs):
+        if not _is_primary_page_heading(para):
+            continue
+        if not _has_meaningful_content_before(para) or _has_previous_section_break(para):
+            continue
+        _insert_section_break_before(para, "oddPage")
+        odd_breaks += 1
+
+    for para in list(doc.paragraphs):
+        if para.text.strip() not in PUBLICATION_SECTION_TITLES:
+            continue
+        if not _has_meaningful_content_before(para) or _has_previous_section_break(para):
+            continue
+        _insert_section_break_before(para, "nextPage")
+        normal_breaks += 1
+
+    if report and (odd_breaks or normal_breaks):
+        report.note(f"已插入分页控制：一级/前置标题奇数页 {odd_breaks} 处，成果小节单独新页 {normal_breaks} 处。")
+
+
 def _set_border(parent, edge: str, *, val: str, size_eighths_pt: int = 0) -> None:
     border = OxmlElement(f"w:{edge}")
     border.set(qn("w:val"), val)
@@ -561,6 +1001,34 @@ def postprocess_docx(
     _replace_placeholders(doc, report, references=references)
     _format_paragraphs(doc, report)
     _format_tables(doc)
+    _insert_page_section_breaks(doc, report)
+    _convert_images_to_top_bottom_wrap(doc, report)
     _format_headers_and_footers(doc, metadata)
+    if not _replace_marker_with_template(
+        doc,
+        COVER_MARKER,
+        COVER_TEMPLATE_PATH,
+        metadata,
+        report,
+        kind="cover",
+        note="官方封面",
+    ):
+        _prepend_template(
+            doc,
+            COVER_TEMPLATE_PATH,
+            metadata,
+            report,
+            kind="cover",
+            note="官方封面",
+        )
+    _replace_marker_with_template(
+        doc,
+        DECLARATION_MARKER,
+        DECLARATION_TEMPLATE_PATH,
+        metadata,
+        report,
+        kind="declaration",
+        note="原创性声明和授权使用声明",
+    )
     doc.save(path)
-    report.note("已应用 HEU Engineering A4 页面、正文、标题、题注、表格、参考文献、页眉页脚与目录域后处理。")
+    report.note("已应用 HEU Engineering A4 页面、正文、标题、题注、表格、参考文献、分页、图片环绕、页眉页脚与目录域后处理。")
