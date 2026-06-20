@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from .latex_parser import latex_to_plain, read_text
+
+
+def _split_bib_fields(body: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    start = 0
+    depth = 0
+    in_quote = False
+    parts: list[str] = []
+    for idx, ch in enumerate(body):
+        if ch == '"' and (idx == 0 or body[idx - 1] != "\\"):
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append(body[start:idx])
+                start = idx + 1
+    parts.append(body[start:])
+    for part in parts:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        value = value.strip().strip(",").strip()
+        if (value.startswith("{") and value.endswith("}")) or (
+            value.startswith('"') and value.endswith('"')
+        ):
+            value = value[1:-1]
+        fields[key.strip().lower()] = latex_to_plain(value)
+    return fields
+
+
+def parse_bibtex(path: Path) -> list[dict[str, str]]:
+    text = read_text(path)
+    entries: list[dict[str, str]] = []
+    pattern = re.compile(r"@(\w+)\s*\{\s*([^,]+)\s*,", re.S)
+    pos = 0
+    while True:
+        match = pattern.search(text, pos)
+        if not match:
+            break
+        depth = 0
+        end = match.end()
+        for idx in range(match.end() - 1, len(text)):
+            if text[idx] == "{":
+                depth += 1
+            elif text[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = idx
+                    break
+        body = text[match.end() : end]
+        fields = _split_bib_fields(body)
+        fields["_type"] = match.group(1).lower()
+        fields["_key"] = match.group(2).strip()
+        entries.append(fields)
+        pos = end + 1
+    return entries
+
+
+def format_reference(entry: dict[str, str], index: int) -> str:
+    authors = entry.get("author") or entry.get("editor") or ""
+    title = entry.get("title", "")
+    year = entry.get("year") or entry.get("date", "")
+    journal = entry.get("journal") or entry.get("booktitle") or ""
+    publisher = entry.get("publisher") or entry.get("school") or entry.get("institution") or ""
+    address = entry.get("address", "")
+    pages = entry.get("pages", "")
+    parts = []
+    if authors:
+        parts.append(authors)
+    if title:
+        parts.append(title)
+    source = journal or publisher
+    if source:
+        if address and publisher:
+            source = f"{address}: {publisher}"
+        parts.append(source)
+    if year:
+        parts.append(year)
+    if pages:
+        parts.append(pages)
+    body = ". ".join(part for part in parts if part).rstrip(".")
+    return f"[{index}] {body}."
+
+
+def collect_references(paths: list[Path]) -> list[str]:
+    refs: list[str] = []
+    for path in paths:
+        for entry in parse_bibtex(path):
+            refs.append(format_reference(entry, len(refs) + 1))
+    return refs

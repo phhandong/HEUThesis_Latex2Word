@@ -1,0 +1,58 @@
+% !Mode:: "TeX:UTF-8"
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%                          大工至善，大学至真
+%
+%                        哈尔滨工程大学论文模板
+%
+%                      Email: heu_handong@163.com
+%                      https://www.hrbeu.edu.cn
+%
+%               https://github.com/phhandong/HeuThesis_Overleaf
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\documentclass[fontset=fandol,type=master,language=english]{heuthesisbook}
+% No space between options
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Mandatory option
+% type=doctor|master|bachelor|postdoc
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Optional option (with default value)
+% campus=qingdao|yantai|harbin
+%   Default:harbin
+% glue=true|false
+%   Line spacing: true means [3,4]mm, false means 3mm。
+% tocfour=true|false
+%   TOC level four or three
+% fontset=windows|mac|ubuntu|fandol|adobe|founder
+%   Normally, TeX could detect your OS font automatically. If not, explicitly
+%   set your OS here, or, use open source font set
+% openright=true|false
+%   Force the Chapter page number to be even or not.
+% pageempty=true|false
+%   Epmty page without pagehead and pagefoot
+% library=true|false
+%   Set this option will remove all blank page in your thesis, Library preferred.
+% newtxmath=true|false
+%   Math font used in the thesis
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\usepackage{heuthesis}
+\graphicspath{{figures/}}
+\begin{document}
+
+\frontmatter
+\input{front/cover}
+\makecover
+\include{front/acknowledgements}
+\tableofcontents
+
+\mainmatter
+\include{body/eng_regu}
+
+\backmatter
+\include{back/conclusion}
+\bibliographystyle{heuthesis}
+\bibliography{reference}
+\include{back/publications}
+\end{document}
+
