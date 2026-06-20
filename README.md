@@ -1,6 +1,6 @@
 # HEUThesis LaTeX to Word
 
-把 HEU `heuthesisbook` LaTeX 项目转换为可编辑 `.docx`。第一版优先覆盖工程硕士、工程博士论文，按 `requirements/Engineering` 中的最新 Word 要求做后处理。
+把哈尔滨工程大学（Harbin Engineering University）学位论文的 LaTeX 版本转换为可编辑 Word版本。现在优先覆盖工程硕士、工程博士论文，按 `requirements/Engineering` 中的最新 Word 要求做后处理。
 
 ## 运行
 
@@ -44,3 +44,12 @@ pip install -r requirements.txt
 - 复杂公式如果 Pandoc 无法转换，会保留 TeX 表达并写入报告。
 - EPS/TikZ 等图形不保证可编辑；能被 Pandoc 处理时会嵌入，否则报告降级。
 - Word 目录域需要在 Word/WPS 中手动更新域刷新页码。
+
+## 配合食用
+[HeuThesis_Overleaf](https://github.com/phhandong/HeuThesis_Overleaf)
+
+## TODO 
+- Github 自动化流程编译成本地使用的软件
+- 完善排版细节：中英文标题、交叉引用、目录、页首
+- 适配经管等专业的封面适配
+- 加入AI排版功能，提供更加精细的排版检查和修复
