@@ -7,6 +7,12 @@ __pycache__/
 .venv/
 venv/
 env/
+_vis/
+
+# Local conversion smoke-test outputs
+heu_word_enhanced_test.docx
+heu_word_enhanced_test.pdf
+heu_word_enhanced_test.report.md
 
 # Local editor and OS files
 .idea/

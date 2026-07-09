@@ -12,22 +12,30 @@ _COMMENT_SENTINEL = "\0PERCENT\0"
 class ThesisMetadata:
     degree: str | None = None
     state_secrets: str = ""
+    secret_level: str = ""
     document_number: str = ""
     classified_index: str = ""
     udc: str = ""
     title_cn: str = ""
     title_cover_cn: str = ""
     title_en: str = ""
+    discipline_cn: str = ""
+    discipline_en: str = ""
     author_cn: str = ""
     author_en: str = ""
     supervisor_cn: str = ""
     supervisor_en: str = ""
     cosupervisor_cn: str = ""
     cosupervisor_en: str = ""
+    co_supervisor_cn: str = ""
+    co_supervisor_en: str = ""
+    associate_supervisor_cn: str = ""
+    associate_supervisor_en: str = ""
     affiliation_cn: str = ""
     affiliation_en: str = ""
     subject_cn: str = ""
     subject_en: str = ""
+    professional_title_cn: str = ""
     student_id: str = ""
     submit_date_cn: str = ""
     submit_date_en: str = ""
@@ -83,6 +91,7 @@ class ExpandedLatexProject:
     bibliography_files: list[Path] = field(default_factory=list)
     resource_paths: list[Path] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    soft_linebreaks_merged: int = 0
 
 
 def read_text(path: Path) -> str:
@@ -122,6 +131,62 @@ def latex_to_plain(text: str) -> str:
     text = re.sub(r"\\[a-zA-Z]+\*?", "", text)
     text = text.replace("{", "").replace("}", "")
     return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def normalize_soft_linebreaks(text: str) -> tuple[str, int]:
+    protected_envs = {
+        "align",
+        "align*",
+        "array",
+        "equation",
+        "equation*",
+        "figure",
+        "lstlisting",
+        "longtable",
+        "table",
+        "tabular",
+        "tabularx",
+        "verbatim",
+    }
+    command_boundary = re.compile(
+        r"^\\(?:begin|end|chapter|section|subsection|subsubsection|paragraph|"
+        r"item|caption|label|includegraphics|bibliography|newpage|clearpage|"
+        r"cleardoublepage|[([])"
+    )
+
+    def env_delta(line: str) -> int:
+        delta = 0
+        for match in re.finditer(r"\\(begin|end)\{([^{}]+)\}", line):
+            if match.group(2) in protected_envs:
+                delta += 1 if match.group(1) == "begin" else -1
+        return delta
+
+    def can_merge(prev: str, current: str, protected_depth: int) -> bool:
+        if protected_depth > 0:
+            return False
+        prev_s = prev.strip()
+        current_s = current.strip()
+        if not prev_s or not current_s:
+            return False
+        if prev_s.endswith((r"\\", "{", "[", "&")):
+            return False
+        if command_boundary.match(prev_s) or command_boundary.match(current_s):
+            return False
+        return True
+
+    merged: list[str] = []
+    count = 0
+    protected_depth = 0
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if merged and can_merge(merged[-1], line, protected_depth):
+            merged[-1] = f"{merged[-1].rstrip()} {stripped}"
+            count += 1
+        else:
+            merged.append(line)
+        protected_depth = max(0, protected_depth + env_delta(stripped))
+    return "\n".join(merged), count
 
 
 def _find_braced_after(text: str, start: int) -> tuple[str, int] | None:
@@ -211,7 +276,8 @@ def extract_environment(text: str, env: str) -> str:
     match = pattern.search(text)
     if not match:
         return ""
-    return latex_to_plain(match.group(1))
+    normalized, _ = normalize_soft_linebreaks(match.group(1))
+    return latex_to_plain(normalized)
 
 
 def parse_documentclass_degree(text: str) -> str | None:
@@ -257,22 +323,30 @@ def _metadata_from_sources(
     metadata = ThesisMetadata(
         degree=degree,
         state_secrets=value("statesecrets"),
+        secret_level=value("statesecrets"),
         document_number=value("cnumber"),
         classified_index=value("natclassifiedindex"),
         udc=value("intclassifiedindex"),
         title_cn=value("ctitle"),
         title_cover_cn=value("ctitlecover"),
         title_en=value("etitle"),
+        discipline_cn=value("cxueke"),
+        discipline_en=value("exueke"),
         author_cn=value("cauthor"),
         author_en=value("eauthor"),
         supervisor_cn=value("csupervisor"),
         supervisor_en=value("esupervisor"),
         cosupervisor_cn=value("ccosupervisor") or value("cassosupervisor"),
         cosupervisor_en=value("ecosupervisor") or value("eassosupervisor"),
+        co_supervisor_cn=value("ccosupervisor"),
+        co_supervisor_en=value("ecosupervisor"),
+        associate_supervisor_cn=value("cassosupervisor"),
+        associate_supervisor_en=value("eassosupervisor"),
         affiliation_cn=value("caffil"),
         affiliation_en=value("eaffil"),
         subject_cn=value("csubject"),
         subject_en=value("esubject"),
+        professional_title_cn=value("cprofessional"),
         student_id=value("cstudentid"),
         submit_date_cn=value("csubmitdate") or value("cdate"),
         submit_date_en=value("esubmitdate") or value("edate"),
@@ -349,7 +423,7 @@ def expand_project(main_file: str | Path, degree_override: str | None = None) ->
             lines.append(line)
         return "\n".join(lines)
 
-    expanded = expand_latex_text(main_text, root)
+    expanded, soft_linebreaks_merged = normalize_soft_linebreaks(expand_latex_text(main_text, root))
     cover_blob = "\n".join(cover_texts)
     metadata = _metadata_from_sources(setup, cover_blob, degree)
 
@@ -361,4 +435,5 @@ def expand_project(main_file: str | Path, degree_override: str | None = None) ->
         bibliography_files=bibliography_files,
         resource_paths=resource_paths,
         warnings=warnings,
+        soft_linebreaks_merged=soft_linebreaks_merged,
     )

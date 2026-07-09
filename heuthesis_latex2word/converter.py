@@ -82,11 +82,11 @@ def _run_pandoc(
 
 def convert_project(options: ConversionOptions) -> ConversionResult:
     report = ConversionReport()
-    input_file = Path(options.input_file).resolve()
-    output_file = Path(options.output_file).resolve()
+    input_file = Path(options.input_file).absolute()
+    output_file = Path(options.output_file).absolute()
     output_file.parent.mkdir(parents=True, exist_ok=True)
     report_file = (
-        Path(options.report_file).resolve()
+        Path(options.report_file).absolute()
         if options.report_file
         else output_file.with_suffix(".report.md")
     )
@@ -95,6 +95,8 @@ def convert_project(options: ConversionOptions) -> ConversionResult:
     report.extend_warnings(project.warnings)
     report.note(f"输入主文件: {project.main_file}")
     report.note(f"输出学位类型: {project.metadata.degree_label}")
+    if project.soft_linebreaks_merged:
+        report.note(f"已智能合并 LaTeX 正文软换行 {project.soft_linebreaks_merged} 处。")
 
     with tempfile.TemporaryDirectory(prefix="heuthesis_l2w_") as tmp:
         temp_latex = Path(tmp) / "pandoc_input.tex"

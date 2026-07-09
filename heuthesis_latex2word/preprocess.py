@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import re
+import base64
 from pathlib import Path
 
 from .latex_parser import ExpandedLatexProject, ThesisMetadata
 
-
 COVER_MARKER = "HEU_COVER_PLACEHOLDER"
+HEU_COVER_PLACEHOLDER = COVER_MARKER
 DECLARATION_MARKER = "HEU_DECLARATION_PLACEHOLDER"
+CITATION_PLACEHOLDER_RE = re.compile(r"HEU_CITE_(TEXT|SUPER)_([A-Za-z0-9_.-]+)_END")
 
 
 def _latex_escape(text: str) -> str:
@@ -26,38 +28,6 @@ def _latex_escape(text: str) -> str:
 
 def _paragraphs(text: str) -> str:
     return "\n\n".join(_latex_escape(line.strip()) for line in text.splitlines() if line.strip())
-
-
-def build_cover_latex(metadata: ThesisMetadata) -> str:
-    rows = [
-        ("论文作者", metadata.author_cn),
-        ("指导教师", metadata.supervisor_cn),
-        ("所在学院", metadata.affiliation_cn),
-        ("专业领域", metadata.subject_cn),
-        ("学号", metadata.student_id),
-        ("提交日期", metadata.submit_date_cn),
-        ("答辩日期", metadata.oral_date_cn),
-    ]
-    row_text = "\n\n".join(f"{label}：{_latex_escape(value)}" for label, value in rows if value)
-    return rf"""
-\begin{{center}}
-{{\Large {_latex_escape(metadata.document_label)}}}
-
-\vspace{{2em}}
-
-{{\LARGE {_latex_escape(metadata.display_title_cn)}}}
-
-\vspace{{2em}}
-
-{_latex_escape(metadata.degree_label)}
-\end{{center}}
-
-\vspace{{2em}}
-
-{row_text}
-
-\newpage
-"""
 
 
 def build_declaration_latex() -> str:
@@ -116,6 +86,27 @@ HEU_TOC_PLACEHOLDER
 """
 
 
+def _citation_slug(keys: str) -> str:
+    encoded = []
+    for key in (key.strip() for key in keys.split(",")):
+        if key:
+            token = base64.urlsafe_b64encode(key.encode("utf-8")).decode("ascii").rstrip("=")
+            encoded.append(token)
+    return ".".join(encoded)
+
+
+def _replace_citations(text: str) -> str:
+    def text_cite(match: re.Match[str]) -> str:
+        return f"HEU_CITE_TEXT_{_citation_slug(match.group(1))}_END"
+
+    def super_cite(match: re.Match[str]) -> str:
+        return f"HEU_CITE_SUPER_{_citation_slug(match.group(1))}_END"
+
+    cite_keys = r"([0-9A-Za-z_.:;,+\-\s]+)"
+    text = re.sub(r"\\(?:inlinecite|onlinecite|lcite)\{" + cite_keys + r"\}", text_cite, text)
+    return re.sub(r"\\(?:citeup|cite)\{" + cite_keys + r"\}", super_cite, text)
+
+
 def _neutralize_heu_macros(text: str, metadata: ThesisMetadata, include_auth_scan: Path | None) -> str:
     text = re.sub(r"\\documentclass(?:\[[^\]]*\])?\{heuthesisbook\}", r"\\documentclass{book}", text)
     text = re.sub(r"\\usepackage\{heuthesis\}", "", text)
@@ -158,7 +149,7 @@ def _neutralize_heu_macros(text: str, metadata: ThesisMetadata, include_auth_sca
     text = re.sub(r"\\end\{publist\}", r"\\end{itemize}", text)
     text = re.sub(r"\\(songti|heiti|kaishu|fangsong|xiaosi|wuhao|xiaoer|sanhao|sihao)(?:\[[^\]]*\])?", "", text)
     text = re.sub(r"\\cs\s+([A-Za-z]+)", r"\\textbackslash{}\1", text)
-    return text
+    return _replace_citations(text)
 
 
 def _resolve_graphics_extensions(text: str, resource_paths: list[Path]) -> str:

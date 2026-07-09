@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from .latex_parser import latex_to_plain, read_text
+
+
+@dataclass(frozen=True)
+class ReferenceEntry:
+    key: str
+    index: int
+    text: str
 
 
 def _split_bib_fields(body: str) -> dict[str, str]:
@@ -91,9 +99,16 @@ def format_reference(entry: dict[str, str], index: int) -> str:
     return f"[{index}] {body}."
 
 
-def collect_references(paths: list[Path]) -> list[str]:
-    refs: list[str] = []
+def collect_references(paths: list[Path]) -> list[ReferenceEntry]:
+    refs: list[ReferenceEntry] = []
     for path in paths:
         for entry in parse_bibtex(path):
-            refs.append(format_reference(entry, len(refs) + 1))
+            index = len(refs) + 1
+            refs.append(
+                ReferenceEntry(
+                    key=entry.get("_key", ""),
+                    index=index,
+                    text=format_reference(entry, index),
+                )
+            )
     return refs
