@@ -9,7 +9,7 @@ from .latex_parser import ExpandedLatexProject, ThesisMetadata
 COVER_MARKER = "HEU_COVER_PLACEHOLDER"
 HEU_COVER_PLACEHOLDER = COVER_MARKER
 DECLARATION_MARKER = "HEU_DECLARATION_PLACEHOLDER"
-CITATION_PLACEHOLDER_RE = re.compile(r"HEU_CITE_(TEXT|SUPER)_([A-Za-z0-9_.-]+)_END")
+CITATION_PLACEHOLDER_RE = re.compile(r"HEU_CITE_(TEXT|SUPER)_([A-Za-z0-9_.-]+?)_END")
 
 
 def _latex_escape(text: str) -> str:
@@ -40,15 +40,15 @@ def build_declaration_latex() -> str:
 
 作者签名：\hspace{8em} 日期：\hspace{6em}
 
-\newpage
-
 \section*{学位论文授权使用声明}
 
 本人完全了解学校保护知识产权的有关规定，即研究生在校攻读学位期间论文工作的知识产权属于哈尔滨工程大学。哈尔滨工程大学有权保留并向国家有关部门或机构送交论文的复印件。本人允许哈尔滨工程大学将论文的部分或全部内容编入有关数据库进行检索，可采用影印、缩印或扫描等复制手段保存和汇编本学位论文，可以公布论文的全部内容。同时本人保证毕业后结合学位论文研究课题再撰写的论文一律注明作者第一署名单位为哈尔滨工程大学。涉密学位论文待解密后适用本声明。
 
 \vspace{2em}
 
-作者签名：\hspace{8em} 导师签名：\hspace{8em} 日期：\hspace{6em}
+作者签名：\hspace{8em} 导师签名：\hspace{8em}
+
+日期：\hspace{5em} 年\hspace{2em}月\hspace{2em}日\hspace{8em}日期：\hspace{5em} 年\hspace{2em}月\hspace{2em}日
 
 \newpage
 """
