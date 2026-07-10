@@ -8,7 +8,7 @@ from pathlib import Path
 from docx import Document
 from docx.enum.section import WD_SECTION_START
 from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING, WD_TAB_ALIGNMENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -55,9 +55,17 @@ FRONT_MATTER_TITLES = {
     "插图清单",
     "附表清单",
 }
+ROMAN_PAGE_TITLES = {
+    "摘要",
+    "Abstract",
+    "目录",
+    "插图清单",
+    "附表清单",
+}
 
 CAPTION_PREFIX_RE = re.compile(r"^[图表]\s*\d+(?:\.\d+)+")
 REFERENCE_ENTRY_RE = re.compile(r"^\[\d+\]")
+CHAPTER_PREFIX_RE = re.compile(r"^第\s*([0-9一二三四五六七八九十百]+)\s*章\s*")
 COVER_MARKER = "HEU_COVER_PLACEHOLDER"
 HEU_COVER_PLACEHOLDER = COVER_MARKER
 DECLARATION_MARKER = "HEU_DECLARATION_PLACEHOLDER"
@@ -81,19 +89,44 @@ def _engineering_template_path(filename: str) -> Path:
     return _repo_root() / "requirements" / "Engineering" / filename
 
 
-COVER_TEMPLATE_PATH = _engineering_template_path("封面.docx")
+COVER_TEMPLATE_PATH = _repo_root() / "cover.docx"
+COVER_FALLBACK_TEMPLATE_PATH = _engineering_template_path("封面.docx")
 DECLARATION_TEMPLATE_PATH = _engineering_template_path("5.学位论文原创性声明和授权使用声明(最新).docx")
 HEU_STYLES = {
-    "body": "HEU Body",
-    "chapter": "HEU Chapter Title",
-    "section": "HEU Section Title",
-    "subsection": "HEU Subsection Title",
-    "subsubsection": "HEU Subsubsection Title",
-    "caption": "HEU Caption",
-    "reference": "HEU Reference",
-    "cover_title": "HEU Cover Title",
-    "cover_meta": "HEU Cover Meta",
-    "cover_small": "HEU Cover Small",
+    "body": "正文",
+    "body_inline_math": "正文（内嵌公式）",
+    "chapter": "章标题",
+    "section": "节标题",
+    "subsection": "小节标题",
+    "subsubsection": "四级标题",
+    "caption": "图表题注",
+    "figure": "图片",
+    "display_math": "独立公式",
+    "reference": "参考文献",
+    "cover_title": "封面题名",
+    "cover_meta": "封面信息",
+    "cover_small": "封面小字",
+}
+LEGACY_HEU_STYLE_NAMES = {
+    "HEU Body",
+    "HEU Body Inline Math",
+    "HEU Chapter Title",
+    "HEU Section Title",
+    "HEU Subsection Title",
+    "HEU Subsubsection Title",
+    "HEU Caption",
+    "HEU Figure",
+    "HEU Display Math",
+    "HEU Reference",
+    "HEU Cover Title",
+    "HEU Cover Meta",
+    "HEU Cover Small",
+}
+KEEP_CUSTOM_STYLE_NAMES = set(HEU_STYLES.values()) | {
+    "封面宋体小2",
+    "封面2号黑体英文论文名称",
+    "英文扉页姓名信息",
+    "原创性声明内容样式",
 }
 
 
@@ -128,6 +161,26 @@ def _set_style_font(style, font_cn: str, font_en: str, size_pt: float, bold: boo
     rfonts.set(qn("w:hAnsi"), font_en)
 
 
+def _remove_child(element, tag: str) -> None:
+    if element is None:
+        return
+    for child in list(element.findall(qn(tag))):
+        element.remove(child)
+
+
+def _clear_text_direct_formatting(paragraph) -> None:
+    ppr = paragraph._p.pPr
+    if ppr is not None:
+        for tag in ("w:jc", "w:spacing", "w:ind"):
+            _remove_child(ppr, tag)
+    for run in paragraph.runs:
+        rpr = run._r.rPr
+        if rpr is None:
+            continue
+        for tag in ("w:rStyle", "w:rFonts", "w:sz", "w:szCs", "w:color"):
+            _remove_child(rpr, tag)
+
+
 def _set_paragraph_layout(
     paragraph,
     *,
@@ -149,6 +202,45 @@ def _set_paragraph_layout(
 
 
 def _set_style_paragraph_layout(
+    style,
+    *,
+    alignment: WD_ALIGN_PARAGRAPH | None,
+    first_line_indent_pt: float | None,
+    line_spacing_pt: float,
+    space_before_pt: float,
+    space_after_pt: float,
+) -> None:
+    if alignment is not None:
+        style.paragraph_format.alignment = alignment
+    style.paragraph_format.first_line_indent = (
+        None if first_line_indent_pt is None else Pt(first_line_indent_pt)
+    )
+    style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+    style.paragraph_format.line_spacing = Pt(line_spacing_pt)
+    style.paragraph_format.space_before = Pt(space_before_pt)
+    style.paragraph_format.space_after = Pt(space_after_pt)
+
+
+def _set_style_single_line_layout(
+    style,
+    *,
+    alignment: WD_ALIGN_PARAGRAPH | None,
+    first_line_indent_pt: float | None,
+    space_before_pt: float,
+    space_after_pt: float,
+) -> None:
+    if alignment is not None:
+        style.paragraph_format.alignment = alignment
+    style.paragraph_format.first_line_indent = (
+        None if first_line_indent_pt is None else Pt(first_line_indent_pt)
+    )
+    style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+    style.paragraph_format.line_spacing = 1.0
+    style.paragraph_format.space_before = Pt(space_before_pt)
+    style.paragraph_format.space_after = Pt(space_after_pt)
+
+
+def _set_style_exact_line_layout(
     style,
     *,
     alignment: WD_ALIGN_PARAGRAPH | None,
@@ -221,6 +313,17 @@ def _clear_paragraph(paragraph) -> None:
     for run in list(paragraph.runs):
         paragraph._p.remove(run._r)
 
+
+def _reset_cover_field_indent(paragraph) -> None:
+    ppr = paragraph._p.get_or_add_pPr()
+    for old in list(ppr.findall(qn("w:ind"))):
+        ppr.remove(old)
+    ind = OxmlElement("w:ind")
+    ind.set(qn("w:left"), "0")
+    ind.set(qn("w:firstLine"), "0")
+    ppr.append(ind)
+
+
 def _set_paragraph_text(paragraph, text: str) -> None:
     if paragraph.runs:
         paragraph.runs[0].text = text
@@ -235,6 +338,61 @@ def _set_cell_text(cell, text: str) -> None:
     _set_paragraph_text(para, text)
     for extra in cell.paragraphs[1:]:
         _clear_paragraph(extra)
+
+
+def _strip_cover_annotations(text: str) -> str:
+    text = re.sub(r"（[^（）]*(?:宋体|黑体|楷体|Times New Roman)[^（）]*）", "", text)
+    return re.sub(r"[ \t]+$", "", text)
+
+
+def _set_cover_top_line(
+    paragraph,
+    left_label: str,
+    left_value: str,
+    right_label: str,
+    right_value: str,
+) -> None:
+    _clear_paragraph(paragraph)
+    paragraph.paragraph_format.tab_stops.clear_all()
+    paragraph.paragraph_format.tab_stops.add_tab_stop(Cm(15.0), WD_TAB_ALIGNMENT.RIGHT)
+    paragraph.add_run(left_label)
+    left_run = paragraph.add_run(left_value or "               ")
+    left_run.underline = True
+    paragraph.add_run("\t")
+    paragraph.add_run(right_label)
+    right_run = paragraph.add_run(right_value or "               ")
+    right_run.underline = True
+
+
+def _set_cover_field_line(paragraph, label: str, value: str) -> None:
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    paragraph.paragraph_format.tab_stops.clear_all()
+    _clear_paragraph(paragraph)
+    _reset_cover_field_indent(paragraph)
+    run = paragraph.add_run(f"　　　　　　　　　{_spread_cover_label(label)}{value}")
+    _set_run_font(run, "宋体", "Times New Roman", 15.0, False)
+
+
+def _set_cover_plain_text(paragraph, text: str) -> None:
+    _set_paragraph_text(paragraph, _strip_cover_annotations(text))
+
+
+def _spread_cover_label(label: str) -> str:
+    label = label.replace("：", "").replace(" ", "")
+    label_map = {
+        "硕士研究生": "硕士研究生：　",
+        "博士研究生": "博士研究生：　",
+        "指导教师": "指导教师：　　",
+        "校外导师": "校外导师：　　",
+        "学位类别": "学位类别：　　",
+    }
+    if label in label_map:
+        return label_map[label]
+    if label == "学位类别":
+        return "学位类别：　　"
+    if len(label) <= 1:
+        return f"{label}："
+    return f"{' '.join(label)}："
 
 
 def _element_text(element) -> str:
@@ -277,6 +435,68 @@ def _section_break_paragraph(doc: Document, section_type: str = "nextPage"):
     return paragraph
 
 
+def _paragraph_section_properties(element):
+    if element.tag != qn("w:p"):
+        return None
+    ppr = element.find(qn("w:pPr"))
+    if ppr is None:
+        return None
+    return ppr.find(qn("w:sectPr"))
+
+
+def _set_section_page_numbering(sect_pr, fmt: str | None, start: int | None = None) -> None:
+    for old in list(sect_pr.findall(qn("w:pgNumType"))):
+        sect_pr.remove(old)
+    if fmt is None:
+        return
+    pg_num = OxmlElement("w:pgNumType")
+    pg_num.set(qn("w:fmt"), fmt)
+    if start is not None:
+        pg_num.set(qn("w:start"), str(start))
+    sect_pr.append(pg_num)
+
+
+def _block_text(element) -> str:
+    return "".join(node.text or "" for node in element.iter(qn("w:t"))).strip()
+
+
+def _section_blocks(doc: Document):
+    blocks = []
+    for child in doc._element.body:
+        if child.tag == qn("w:sectPr"):
+            if blocks:
+                yield blocks, child
+                blocks = []
+            continue
+        blocks.append(child)
+        sect_pr = _paragraph_section_properties(child)
+        if sect_pr is not None:
+            yield blocks, sect_pr
+            blocks = []
+
+
+def _first_meaningful_section_text(blocks) -> str:
+    for block in blocks:
+        text = _block_text(block)
+        if text:
+            return text
+    return ""
+
+
+def _apply_section_page_numbering_by_content(doc: Document) -> None:
+    decimal_started = False
+    for blocks, sect_pr in _section_blocks(doc):
+        start_text = _first_meaningful_section_text(blocks)
+        _set_section_page_numbering(sect_pr, None)
+        if start_text in ROMAN_PAGE_TITLES:
+            _set_section_page_numbering(sect_pr, "upperRoman", 1 if start_text == "摘要" else None)
+        elif CHAPTER_PREFIX_RE.match(start_text):
+            _set_section_page_numbering(sect_pr, "decimal", 1 if not decimal_started else None)
+            decimal_started = True
+        elif decimal_started:
+            _set_section_page_numbering(sect_pr, "decimal", None)
+
+
 def _page_break_paragraph():
     paragraph = OxmlElement("w:p")
     run = OxmlElement("w:r")
@@ -295,6 +515,17 @@ def _insert_element_before(paragraph, element) -> None:
 def _insert_section_break_before(paragraph, section_type: str = "nextPage") -> None:
     parent_doc = paragraph._parent.part.document
     _insert_element_before(paragraph, _section_break_paragraph(parent_doc, section_type))
+
+
+def _ensure_section_break_before(paragraph, section_type: str = "nextPage"):
+    sect_pr = _previous_section_properties(paragraph)
+    if sect_pr is not None:
+        _set_section_start_type(sect_pr, section_type)
+        return sect_pr
+    parent_doc = paragraph._parent.part.document
+    element = _section_break_paragraph(parent_doc, section_type)
+    _insert_element_before(paragraph, element)
+    return _paragraph_section_properties(element)
 
 
 def _remove_paragraph(paragraph) -> None:
@@ -319,6 +550,20 @@ def _has_previous_section_break(paragraph) -> bool:
     return False
 
 
+def _previous_section_properties(paragraph):
+    parent = paragraph._p.getparent()
+    index = parent.index(paragraph._p)
+    for previous in reversed(parent[:index]):
+        if previous.tag != qn("w:p"):
+            return None
+        if _element_text(previous).strip():
+            return None
+        sect_pr = _paragraph_section_properties(previous)
+        if sect_pr is not None:
+            return sect_pr
+    return None
+
+
 def _iter_all_paragraphs(doc: Document):
     for para in doc.paragraphs:
         yield para
@@ -334,64 +579,20 @@ def _split_cover_title(title: str) -> list[str]:
     return lines or [title.strip()] if title.strip() else [""]
 
 
-def _apply_cover_metadata(doc: Document, metadata: ThesisMetadata) -> None:
-    title_cn = metadata.display_title_cn
-    title_en_lines = _split_cover_title(metadata.title_en)
-    title_en_first = title_en_lines[0] if title_en_lines else ""
-    title_en_second = " ".join(title_en_lines[1:]) if len(title_en_lines) > 1 else ""
-    school = "哈尔滨工程大学"
+def _supervisor_cn(metadata: ThesisMetadata) -> str:
+    supervisor = metadata.supervisor_cn
+    title = metadata.professional_title_cn
+    if supervisor and title and title not in supervisor:
+        return f"{supervisor} {title}"
+    return supervisor
 
-    for para in _iter_all_paragraphs(doc):
-        text = para.text.strip()
-        if not text:
-            continue
-        if text.startswith("分类号："):
-            _set_paragraph_text(
-                para,
-                f"分类号：{metadata.classified_index or ' '}"
-                f"                          密级：{metadata.state_secrets or ' '}",
-            )
-        elif text.startswith("U D C"):
-            _set_paragraph_text(
-                para,
-                f"U D C ：{metadata.udc or ' '}                          编号：{metadata.document_number or ' '}",
-            )
-        elif "专业学位硕士学位论文" in text or "专业学位博士学位论文" in text:
-            _set_paragraph_text(para, f"          {metadata.document_label}")
-        elif "基于FPGA的高能效XXX应用系统" in text:
-            _set_paragraph_text(para, title_cn)
-        elif text.startswith("硕士研究生：") or text.startswith("博士研究生："):
-            _set_paragraph_text(para, f"{metadata.student_label_cn}：{metadata.author_cn}")
-        elif text.startswith("指导教师："):
-            _set_paragraph_text(para, f"指导教师：{metadata.supervisor_cn}")
-        elif text.startswith("校外导师："):
-            _set_paragraph_text(para, f"校外导师：{metadata.cosupervisor_cn}")
-        elif "学 位 类 别" in text:
-            _set_paragraph_text(para, f"    学 位 类 别 ：{metadata.degree_label}")
-        elif text.startswith(school) and "楷体" in text:
-            _set_paragraph_text(para, school)
-        elif "20XX年X月" in text:
-            _set_paragraph_text(para, metadata.submit_date_cn)
-        elif text.startswith("Classified Index"):
-            _set_paragraph_text(para, f"Classified Index: {metadata.classified_index}")
-        elif text.startswith("U.D.C"):
-            _set_paragraph_text(para, f"U.D.C: {metadata.udc}")
-        elif text.startswith("A Thesis for the Degree of"):
-            _set_paragraph_text(para, f"A Thesis for the Degree of {metadata.degree_label_en}")
-        elif "An Energy Efficient FPGA-based System" in text:
-            _set_paragraph_text(para, title_en_first)
-        elif "for XXX Applications" in text:
-            _set_paragraph_text(para, title_en_second)
 
-    table_value_map = {
-        metadata.student_label_cn: metadata.author_cn,
-        "指导教师": metadata.supervisor_cn,
-        "校外导师": metadata.cosupervisor_cn,
-        "专业类别": metadata.subject_cn,
-        "所在学院": metadata.affiliation_cn,
-        "论文提交日期": metadata.submit_date_cn,
-        "论文答辩日期": metadata.oral_date_cn,
-        "学位授予单位": school,
+def _cover_table_label(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _english_cover_table_values(metadata: ThesisMetadata) -> dict[str, str]:
+    return {
         "Candidate :": metadata.author_en,
         "Supervisor :": metadata.supervisor_en,
         "Associate Supervisor :": metadata.cosupervisor_en,
@@ -401,12 +602,98 @@ def _apply_cover_metadata(doc: Document, metadata: ThesisMetadata) -> None:
         "Date of Oral Examination :": metadata.oral_date_en,
         "University :": "Harbin Engineering University",
     }
+
+
+def _apply_english_cover_paragraphs(doc: Document, metadata: ThesisMetadata) -> None:
+    title_lines = _split_cover_title(metadata.title_en)
+    title_paragraphs = [
+        para
+        for para in doc.paragraphs
+        if (para.style.name if para.style else "") == "封面2号黑体英文论文名称"
+    ]
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        if text.startswith("Classified Index"):
+            _set_cover_plain_text(para, f"Classified Index: {metadata.classified_index}")
+        elif text.startswith("U.D.C"):
+            _set_cover_plain_text(para, f"U.D.C: {metadata.udc}")
+        elif text.startswith("A Thesis for the Degree of"):
+            _set_cover_plain_text(para, f"A Thesis for the Degree of {metadata.degree_label_en}")
+    for index, para in enumerate(title_paragraphs):
+        if index == len(title_paragraphs) - 1:
+            value = " ".join(title_lines[index:]) if index < len(title_lines) else ""
+        else:
+            value = title_lines[index] if index < len(title_lines) else ""
+        _set_cover_plain_text(para, value)
+
+
+def _apply_cover_metadata(doc: Document, metadata: ThesisMetadata) -> None:
+    title_cn = metadata.display_title_cn
+    school = "哈尔滨工程大学"
+    supervisor_cn = _supervisor_cn(metadata)
+    english_table_values = _english_cover_table_values(metadata)
+
+    for para in _iter_all_paragraphs(doc):
+        text = para.text.strip()
+        if not text:
+            continue
+        if text.startswith("分类号："):
+            _set_cover_top_line(
+                para,
+                "分类号：",
+                metadata.classified_index,
+                "密级：",
+                metadata.state_secrets,
+            )
+        elif text.startswith("U D C"):
+            _set_cover_top_line(
+                para,
+                "U D C ：",
+                metadata.udc,
+                "编号：",
+                metadata.document_number,
+            )
+        elif "专业学位硕士学位论文" in text or "专业学位博士学位论文" in text:
+            _set_cover_plain_text(para, metadata.document_label)
+        elif "基于FPGA的高能效XXX应用系统" in text:
+            _set_cover_plain_text(para, title_cn)
+        elif text.startswith("硕士研究生：") or text.startswith("博士研究生："):
+            _set_cover_field_line(para, metadata.student_label_cn, metadata.author_cn)
+        elif text.startswith("指导教师："):
+            _set_cover_field_line(para, "指导教师", supervisor_cn)
+        elif text.startswith("校外导师："):
+            _set_cover_field_line(para, "校外导师", metadata.cosupervisor_cn)
+        elif "学 位 类 别" in text:
+            _set_cover_field_line(para, "学位类别", metadata.degree_label)
+        elif text.startswith(school) and "楷体" in text:
+            _set_cover_plain_text(para, school)
+        elif "20XX年X月" in text:
+            _set_cover_plain_text(para, metadata.submit_date_cn)
+
+    _apply_english_cover_paragraphs(doc, metadata)
+
+    table_value_map = {
+        metadata.student_label_cn: metadata.author_cn,
+        "指导教师": supervisor_cn,
+        "校外导师": metadata.cosupervisor_cn,
+        "专业类别": metadata.subject_cn,
+        "所在学院": metadata.affiliation_cn,
+        "论文提交日期": metadata.submit_date_cn,
+        "论文答辩日期": metadata.oral_date_cn,
+        "学位授予单位": school,
+        **english_table_values,
+    }
     for table in doc.tables:
         for row in table.rows:
             cells = row.cells
             if len(cells) < 2:
                 continue
-            label = cells[0].text.strip()
+            label = _cover_table_label(cells[0].text)
+            if label in {"硕士研究生", "博士研究生"}:
+                _set_cell_text(cells[0], metadata.student_label_cn)
+                label = metadata.student_label_cn
             if label in table_value_map:
                 value = table_value_map[label]
                 prefix = "：" if "：" not in label and not label.endswith(":") else ""
@@ -434,6 +721,33 @@ def _prepare_template_doc(path: Path, metadata: ThesisMetadata, *, kind: str) ->
     elif kind == "declaration":
         _insert_template_break_before(template, "学位论文授权使用声明", include_previous_school_line=True)
     return template
+
+
+def _copy_missing_template_styles(target: Document, template: Document) -> None:
+    target_names = {style.name for style in target.styles}
+    target_ids = {style.style_id for style in target.styles}
+    styles_element = target.styles.element
+    for style in template.styles:
+        if style.name in target_names or style.style_id in target_ids:
+            continue
+        styles_element.append(deepcopy(style._element))
+        target_names.add(style.name)
+        target_ids.add(style.style_id)
+    _format_cover_template_styles(target)
+
+
+def _format_cover_template_styles(doc: Document) -> None:
+    styles = doc.styles
+    if "封面宋体小2" in styles:
+        _set_style_font(styles["封面宋体小2"], "Times New Roman", "Times New Roman", 18.0, False)
+    if "封面2号黑体英文论文名称" in styles:
+        _set_style_font(
+            styles["封面2号黑体英文论文名称"],
+            "Times New Roman",
+            "Times New Roman",
+            22.0,
+            False,
+        )
 
 
 def _template_body_elements(template: Document, *, boundary_type: str | None = "nextPage") -> list:
@@ -490,6 +804,7 @@ def _replace_marker_with_template(
 
     for para in list(doc.paragraphs):
         if para.text.strip() == marker:
+            _copy_missing_template_styles(doc, template)
             if marker == DECLARATION_MARKER:
                 boundary_type = None
             else:
@@ -514,6 +829,7 @@ def _prepend_template(
     if template is None:
         report.warn(f"找不到 {note} 模板：{template_path}")
         return
+    _copy_missing_template_styles(doc, template)
     body = doc._element.body
     insert_at = 0
     for element in _template_body_elements(template, boundary_type="page"):
@@ -530,6 +846,87 @@ def _style(doc: Document, name: str, base: str = "Normal"):
     if base in styles:
         style.base_style = styles[base]
     return style
+
+
+def _show_style_in_gallery(style, priority: int) -> None:
+    element = style._element
+    _remove_child(element, "w:semiHidden")
+    _remove_child(element, "w:unhideWhenUsed")
+    _remove_child(element, "w:qFormat")
+    _remove_child(element, "w:uiPriority")
+    priority_el = OxmlElement("w:uiPriority")
+    priority_el.set(qn("w:val"), str(priority))
+    element.append(priority_el)
+    element.append(OxmlElement("w:qFormat"))
+    try:
+        style.hidden = False
+        style.quick_style = True
+        style.priority = priority
+    except AttributeError:
+        pass
+
+
+def _hide_style_from_gallery(style) -> None:
+    element = style._element
+    _remove_child(element, "w:qFormat")
+    _remove_child(element, "w:uiPriority")
+    if element.find(qn("w:semiHidden")) is None:
+        element.append(OxmlElement("w:semiHidden"))
+    if element.find(qn("w:unhideWhenUsed")) is None:
+        element.append(OxmlElement("w:unhideWhenUsed"))
+    try:
+        style.hidden = True
+        style.quick_style = False
+    except AttributeError:
+        pass
+
+
+def _referenced_style_ids(doc: Document) -> set[str]:
+    style_ids: set[str] = set()
+    for element in doc.element.iter():
+        tag = element.tag
+        if tag in {qn("w:pStyle"), qn("w:rStyle"), qn("w:tblStyle")}:
+            val = element.get(qn("w:val"))
+            if val:
+                style_ids.add(val)
+    return style_ids
+
+
+def _remove_unrelated_custom_styles(doc: Document) -> None:
+    referenced_ids = _referenced_style_ids(doc)
+    styles_element = doc.styles.element
+    for style in list(doc.styles):
+        element = style._element
+        if element.get(qn("w:customStyle")) != "1":
+            continue
+        if style.name in KEEP_CUSTOM_STYLE_NAMES:
+            continue
+        if style.style_id in referenced_ids:
+            _hide_style_from_gallery(style)
+            continue
+        styles_element.remove(element)
+
+
+def _normalize_pandoc_custom_styles(doc: Document) -> None:
+    paragraph_styles = {"Compact", "Definition Term", "Definition"}
+    run_styles = {"Verbatim Char"}
+    for para in doc.paragraphs:
+        style_name = para.style.name if para.style else ""
+        if style_name in paragraph_styles:
+            _set_paragraph_style(para, HEU_STYLES["body"])
+        for run in para.runs:
+            if run.style and run.style.name in run_styles:
+                run.style = doc.styles["Default Paragraph Font"]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    style_name = para.style.name if para.style else ""
+                    if style_name in paragraph_styles:
+                        _set_paragraph_style(para, HEU_STYLES["body"])
+                    for run in para.runs:
+                        if run.style and run.style.name in run_styles:
+                            run.style = doc.styles["Default Paragraph Font"]
 
 
 def _set_paragraph_style(para, style_name: str) -> None:
@@ -622,22 +1019,45 @@ def _format_sections(doc: Document) -> None:
         section.right_margin = Cm(2.5)
         section.header_distance = Cm(2.0)
         section.footer_distance = Cm(2.0)
-        section.start_type = WD_SECTION_START.NEW_PAGE
         section.odd_and_even_pages_header_footer = True
 
 
 def _format_styles(doc: Document) -> None:
     styles = doc.styles
     _style(doc, HEU_STYLES["body"])
+    _style(doc, HEU_STYLES["body_inline_math"], HEU_STYLES["body"])
     _style(doc, HEU_STYLES["chapter"], "Heading 1")
     _style(doc, HEU_STYLES["section"], "Heading 2")
     _style(doc, HEU_STYLES["subsection"], "Heading 3")
     _style(doc, HEU_STYLES["subsubsection"], "Heading 4")
     _style(doc, HEU_STYLES["caption"], "Caption")
+    _style(doc, HEU_STYLES["figure"])
+    _style(doc, HEU_STYLES["display_math"])
     _style(doc, HEU_STYLES["reference"])
     _style(doc, HEU_STYLES["cover_title"])
     _style(doc, HEU_STYLES["cover_meta"])
     _style(doc, HEU_STYLES["cover_small"])
+    for legacy_name in LEGACY_HEU_STYLE_NAMES:
+        if legacy_name in styles:
+            _hide_style_from_gallery(styles[legacy_name])
+
+    gallery_priorities = {
+        HEU_STYLES["chapter"]: 1,
+        HEU_STYLES["section"]: 2,
+        HEU_STYLES["subsection"]: 3,
+        HEU_STYLES["subsubsection"]: 4,
+        HEU_STYLES["body"]: 10,
+        HEU_STYLES["body_inline_math"]: 11,
+        HEU_STYLES["caption"]: 20,
+        HEU_STYLES["figure"]: 21,
+        HEU_STYLES["display_math"]: 22,
+        HEU_STYLES["reference"]: 30,
+        HEU_STYLES["cover_title"]: 40,
+        HEU_STYLES["cover_meta"]: 41,
+        HEU_STYLES["cover_small"]: 42,
+    }
+    for style_name, priority in gallery_priorities.items():
+        _show_style_in_gallery(styles[style_name], priority)
 
     for name in ("Normal", "Body Text", "First Paragraph"):
         if name in styles:
@@ -656,6 +1076,14 @@ def _format_styles(doc: Document) -> None:
         alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
         first_line_indent_pt=FIRST_LINE_INDENT_PT,
         line_spacing_pt=BODY_LINE_SPACING_PT,
+        space_before_pt=0,
+        space_after_pt=0,
+    )
+    _set_style_font(styles[HEU_STYLES["body_inline_math"]], "宋体", "Times New Roman", BODY_SIZE_PT, False)
+    _set_style_single_line_layout(
+        styles[HEU_STYLES["body_inline_math"]],
+        alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+        first_line_indent_pt=FIRST_LINE_INDENT_PT,
         space_before_pt=0,
         space_after_pt=0,
     )
@@ -758,6 +1186,23 @@ def _format_styles(doc: Document) -> None:
         space_before_pt=0,
         space_after_pt=0,
     )
+    _set_style_font(styles[HEU_STYLES["figure"]], "宋体", "Times New Roman", BODY_SIZE_PT, False)
+    _set_style_exact_line_layout(
+        styles[HEU_STYLES["figure"]],
+        alignment=WD_ALIGN_PARAGRAPH.CENTER,
+        first_line_indent_pt=0,
+        line_spacing_pt=1.0,
+        space_before_pt=0,
+        space_after_pt=0,
+    )
+    _set_style_font(styles[HEU_STYLES["display_math"]], "宋体", "Times New Roman", BODY_SIZE_PT, False)
+    _set_style_single_line_layout(
+        styles[HEU_STYLES["display_math"]],
+        alignment=WD_ALIGN_PARAGRAPH.CENTER,
+        first_line_indent_pt=0,
+        space_before_pt=8,
+        space_after_pt=8,
+    )
     _set_style_font(styles[HEU_STYLES["reference"]], "宋体", "Times New Roman", BODY_SIZE_PT, False)
     _set_style_paragraph_layout(
         styles[HEU_STYLES["reference"]],
@@ -799,7 +1244,10 @@ def _format_styles(doc: Document) -> None:
 def _format_headers_and_footers(doc: Document, metadata: ThesisMetadata) -> None:
     school_line = f"哈尔滨工程大学{metadata.degree_label}学位论文"
     for idx, section in enumerate(doc.sections):
-        if idx == 0:
+        sect_pr = section._sectPr
+        pg_num = sect_pr.find(qn("w:pgNumType")) if sect_pr is not None else None
+        has_page_numbering = pg_num is not None
+        if idx == 0 or not has_page_numbering:
             for header in (section.header, section.even_page_header, section.first_page_header):
                 para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
                 _clear_paragraph(para)
@@ -1123,9 +1571,14 @@ def _is_front_matter_title(text: str) -> bool:
     return text.strip() in FRONT_MATTER_TITLES
 
 
+def _is_unnumbered_primary_title(text: str) -> bool:
+    stripped = text.strip()
+    return stripped in FRONT_MATTER_TITLES or stripped in PRIMARY_BACK_MATTER_TITLES or stripped in PUBLICATION_SECTION_TITLES
+
+
 def _is_caption_style(style_name: str, kind: str | None = None) -> bool:
     if kind == "figure":
-        return style_name in {"Image Caption", "Figure Caption"}
+        return style_name in {"Caption", "Image Caption", "Figure Caption"}
     if kind == "table":
         return style_name == "Table Caption"
     return style_name in {"Caption", "Image Caption", "Figure Caption", "Table Caption"}
@@ -1138,6 +1591,10 @@ def _paragraph_has_drawing(para) -> bool:
 
 def _paragraph_has_display_math(para) -> bool:
     return "<m:oMathPara" in para._element.xml
+
+
+def _paragraph_has_math(para) -> bool:
+    return "<m:oMath" in para._element.xml
 
 
 def _wp_child(element, tag: str):
@@ -1288,65 +1745,22 @@ def _replace_citation_placeholders(
 
 def _format_reference_paragraph(para) -> None:
     _set_paragraph_style(para, HEU_STYLES["reference"])
-    _set_paragraph_layout(
-        para,
-        alignment=WD_ALIGN_PARAGRAPH.LEFT,
-        first_line_indent_pt=0,
-        line_spacing_pt=BODY_LINE_SPACING_PT,
-        space_before_pt=0,
-        space_after_pt=0,
-    )
+    _clear_text_direct_formatting(para)
 
 
-def _format_heading_paragraph(para, level: int, text: str) -> None:
+def _format_heading_paragraph(para, level: int, text: str, chapter_no: int | None = None) -> None:
     front_title = _is_front_matter_title(text)
     if level == 1 or front_title:
+        if chapter_no is not None and not CHAPTER_PREFIX_RE.match(text):
+            _replace_text(para, f"第{chapter_no}章 {text}")
         _set_paragraph_style(para, HEU_STYLES["chapter"])
-        _set_paragraph_layout(
-            para,
-            alignment=WD_ALIGN_PARAGRAPH.CENTER,
-            first_line_indent_pt=0,
-            line_spacing_pt=CHAPTER_LINE_SPACING_PT,
-            space_before_pt=CHAPTER_SPACE_BEFORE_PT,
-            space_after_pt=CHAPTER_SPACE_AFTER_PT,
-        )
-        size = CHAPTER_SIZE_PT
     elif level == 2:
         _set_paragraph_style(para, HEU_STYLES["section"])
-        _set_paragraph_layout(
-            para,
-            alignment=WD_ALIGN_PARAGRAPH.LEFT,
-            first_line_indent_pt=0,
-            line_spacing_pt=SECTION_LINE_SPACING_PT,
-            space_before_pt=SECTION_SPACE_PT,
-            space_after_pt=SECTION_SPACE_PT,
-        )
-        size = SECTION_SIZE_PT
     elif level == 3:
         _set_paragraph_style(para, HEU_STYLES["subsection"])
-        _set_paragraph_layout(
-            para,
-            alignment=WD_ALIGN_PARAGRAPH.LEFT,
-            first_line_indent_pt=0,
-            line_spacing_pt=SUBSECTION_LINE_SPACING_PT,
-            space_before_pt=SUBSECTION_SPACE_PT,
-            space_after_pt=SUBSECTION_SPACE_PT,
-        )
-        size = SUBSECTION_SIZE_PT
     else:
         _set_paragraph_style(para, HEU_STYLES["subsubsection"])
-        _set_paragraph_layout(
-            para,
-            alignment=WD_ALIGN_PARAGRAPH.LEFT,
-            first_line_indent_pt=0,
-            line_spacing_pt=SUBSUBSECTION_LINE_SPACING_PT,
-            space_before_pt=SUBSUBSECTION_SPACE_PT,
-            space_after_pt=SUBSUBSECTION_SPACE_PT,
-        )
-        size = SUBSUBSECTION_SIZE_PT
-
-    for run in para.runs:
-        _set_run_font(run, "黑体", "Times New Roman", size, text == "Abstract")
+    _clear_text_direct_formatting(para)
 
 
 def _format_caption_paragraph(para, *, kind: str, chapter_no: int, caption_no: int) -> None:
@@ -1356,36 +1770,12 @@ def _format_caption_paragraph(para, *, kind: str, chapter_no: int, caption_no: i
         _replace_text(para, f"{prefix} {chapter_no}.{caption_no} {text}")
 
     _set_paragraph_style(para, HEU_STYLES["caption"])
-    _set_paragraph_layout(
-        para,
-        alignment=WD_ALIGN_PARAGRAPH.CENTER,
-        first_line_indent_pt=0,
-        line_spacing_pt=CAPTION_LINE_SPACING_PT,
-        space_before_pt=0,
-        space_after_pt=0,
-    )
-    for run in para.runs:
-        _set_run_font(run, "宋体", "Times New Roman", CAPTION_SIZE_PT, False)
+    _clear_text_direct_formatting(para)
 
 
 def _format_body_paragraph(para) -> None:
     _set_paragraph_style(para, HEU_STYLES["body"])
-    if para.text.strip():
-        alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        first_line = FIRST_LINE_INDENT_PT
-    else:
-        alignment = None
-        first_line = None
-    _set_paragraph_layout(
-        para,
-        alignment=alignment,
-        first_line_indent_pt=first_line,
-        line_spacing_pt=BODY_LINE_SPACING_PT,
-        space_before_pt=0,
-        space_after_pt=0,
-    )
-    for run in para.runs:
-        _set_run_font(run, "宋体", "Times New Roman", BODY_SIZE_PT, None)
+    _clear_text_direct_formatting(para)
 
 
 def _format_paragraphs(doc: Document, report: ConversionReport | None = None) -> None:
@@ -1399,13 +1789,15 @@ def _format_paragraphs(doc: Document, report: ConversionReport | None = None) ->
         style_name = para.style.name if para.style else ""
         text = para.text.strip()
 
-        if style_name.startswith("HEU Cover"):
+        if style_name in {HEU_STYLES["cover_title"], HEU_STYLES["cover_meta"], HEU_STYLES["cover_small"]}:
             continue
 
         if style_name.startswith("Heading 1"):
-            if current_chapter > 0 or not _is_front_matter_title(text):
+            if not _is_unnumbered_primary_title(text):
                 current_chapter += 1
-            _format_heading_paragraph(para, 1, text)
+                _format_heading_paragraph(para, 1, text, current_chapter)
+            else:
+                _format_heading_paragraph(para, 1, text)
             continue
         if style_name.startswith("Heading 2"):
             _format_heading_paragraph(para, 2, text)
@@ -1443,31 +1835,22 @@ def _format_paragraphs(doc: Document, report: ConversionReport | None = None) ->
 
         if REFERENCE_ENTRY_RE.match(text):
             _format_reference_paragraph(para)
-            for run in para.runs:
-                _set_run_font(run, "宋体", "Times New Roman", BODY_SIZE_PT, False)
             continue
 
         if _paragraph_has_drawing(para) and not text:
+            _set_paragraph_style(para, HEU_STYLES["figure"])
+            _clear_text_direct_formatting(para)
             _scale_inline_drawings(para)
-            _set_paragraph_layout(
-                para,
-                alignment=WD_ALIGN_PARAGRAPH.CENTER,
-                first_line_indent_pt=0,
-                line_spacing_pt=BODY_LINE_SPACING_PT,
-                space_before_pt=6,
-                space_after_pt=6,
-            )
             continue
 
         if _paragraph_has_display_math(para):
-            _set_paragraph_layout(
-                para,
-                alignment=WD_ALIGN_PARAGRAPH.CENTER,
-                first_line_indent_pt=0,
-                line_spacing_pt=BODY_LINE_SPACING_PT,
-                space_before_pt=8,
-                space_after_pt=8,
-            )
+            _set_paragraph_style(para, HEU_STYLES["display_math"])
+            _clear_text_direct_formatting(para)
+            continue
+
+        if _paragraph_has_math(para):
+            _set_paragraph_style(para, HEU_STYLES["body_inline_math"])
+            _clear_text_direct_formatting(para)
             continue
 
         _format_body_paragraph(para)
@@ -1496,6 +1879,8 @@ def _is_primary_page_heading(para) -> bool:
     style_name = para.style.name if para.style else ""
     return (
         style_name.startswith("Heading 1")
+        or style_name == HEU_STYLES["chapter"]
+        or CHAPTER_PREFIX_RE.match(text) is not None
         or text in FRONT_MATTER_TITLES
         or text in PRIMARY_BACK_MATTER_TITLES
     )
@@ -1504,25 +1889,49 @@ def _is_primary_page_heading(para) -> bool:
 def _insert_page_section_breaks(doc: Document, report: ConversionReport | None = None) -> None:
     odd_breaks = 0
     normal_breaks = 0
+    roman_started = False
+    decimal_started = False
 
     for para in list(doc.paragraphs):
+        text = para.text.strip()
         if not _is_primary_page_heading(para):
             continue
         if not _has_meaningful_content_before(para) or _has_previous_section_break(para):
+            sect_pr = _previous_section_properties(para)
+        else:
+            if text in ROMAN_PAGE_TITLES:
+                sect_pr = _ensure_section_break_before(para, "nextPage")
+                normal_breaks += 1
+            else:
+                sect_pr = _ensure_section_break_before(para, "oddPage")
+                odd_breaks += 1
+
+        if sect_pr is None:
             continue
-        _insert_section_break_before(para, "oddPage")
-        odd_breaks += 1
+        if text in ROMAN_PAGE_TITLES:
+            if text == "摘要" and not roman_started:
+                _set_section_page_numbering(sect_pr, "upperRoman", 1)
+                roman_started = True
+            elif roman_started:
+                _set_section_page_numbering(sect_pr, "upperRoman", None)
+        elif CHAPTER_PREFIX_RE.match(text) and not decimal_started:
+            _set_section_page_numbering(sect_pr, "decimal", 1)
+            decimal_started = True
+        elif decimal_started:
+            _set_section_page_numbering(sect_pr, "decimal", None)
 
     for para in list(doc.paragraphs):
         if para.text.strip() not in PUBLICATION_SECTION_TITLES:
             continue
         if not _has_meaningful_content_before(para) or _has_previous_section_break(para):
             continue
-        _insert_section_break_before(para, "nextPage")
+        sect_pr = _ensure_section_break_before(para, "nextPage")
+        if sect_pr is not None and decimal_started:
+            _set_section_page_numbering(sect_pr, "decimal", None)
         normal_breaks += 1
 
     if report and (odd_breaks or normal_breaks):
-        report.note(f"已插入分页控制：一级/前置标题奇数页 {odd_breaks} 处，成果小节单独新页 {normal_breaks} 处。")
+        report.note(f"已插入分页控制：章标题奇数页 {odd_breaks} 处，前置/成果标题新页 {normal_breaks} 处，并设置前置罗马页码与正文阿拉伯页码。")
 
 
 def _set_border(parent, edge: str, *, val: str, size_eighths_pt: int = 0) -> None:
@@ -1556,9 +1965,37 @@ def _format_table_borders(table) -> None:
         tc_pr.append(tc_borders)
 
 
+def _clear_table_borders(table) -> None:
+    tbl_pr = table._tbl.tblPr
+    for old in list(tbl_pr.findall(qn("w:tblBorders"))):
+        tbl_pr.remove(old)
+    tbl_borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "bottom", "left", "right", "insideV", "insideH"):
+        _set_border(tbl_borders, edge, val="nil")
+    tbl_pr.append(tbl_borders)
+    for row in table.rows:
+        for cell in row.cells:
+            tc_pr = cell._tc.get_or_add_tcPr()
+            for old in list(tc_pr.findall(qn("w:tcBorders"))):
+                tc_pr.remove(old)
+            tc_borders = OxmlElement("w:tcBorders")
+            for edge in ("top", "bottom", "left", "right", "insideV", "insideH"):
+                _set_border(tc_borders, edge, val="nil")
+            tc_pr.append(tc_borders)
+
+
 def _format_tables(doc: Document) -> None:
     for table in doc.tables:
         table_text = "\n".join(cell.text for row in table.rows for cell in row.cells)
+        if "<w:drawing" in table._tbl.xml or "<wp:inline" in table._tbl.xml:
+            _clear_table_borders(table)
+            table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        _set_paragraph_style(para, HEU_STYLES["figure"])
+                        _clear_text_direct_formatting(para)
+            continue
         if any(
             token in table_text
             for token in (
@@ -1605,7 +2042,6 @@ def postprocess_docx(
     _format_tables(doc)
     _insert_page_section_breaks(doc, report)
     _convert_images_to_top_bottom_wrap(doc, report)
-    _format_headers_and_footers(doc, metadata)
     if not _replace_marker_with_template(
         doc,
         COVER_MARKER,
@@ -1614,6 +2050,14 @@ def postprocess_docx(
         report,
         kind="cover",
         note="官方封面",
+    ) and not _replace_marker_with_template(
+        doc,
+        COVER_MARKER,
+        COVER_FALLBACK_TEMPLATE_PATH,
+        metadata,
+        report,
+        kind="cover",
+        note="备用官方封面",
     ):
         _replace_cover_placeholder(doc, metadata, report)
     _replace_marker_with_template(
@@ -1625,5 +2069,10 @@ def postprocess_docx(
         kind="declaration",
         note="原创性声明和授权使用声明",
     )
+    _format_sections(doc)
+    _apply_section_page_numbering_by_content(doc)
+    _format_headers_and_footers(doc, metadata)
+    _normalize_pandoc_custom_styles(doc)
+    _remove_unrelated_custom_styles(doc)
     doc.save(path)
     report.note("已应用 HEU Engineering A4 页面、正文、标题、题注、表格、参考文献、分页、图片环绕、页眉页脚与目录域后处理。")
