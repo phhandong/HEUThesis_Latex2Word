@@ -11,6 +11,7 @@ from .bibliography import collect_references
 from .postprocess import postprocess_docx
 from .preprocess import make_pandoc_latex
 from .report import ConversionReport
+from .word_finalize import finalize_word_fields
 
 
 @dataclass
@@ -117,6 +118,7 @@ def convert_project(options: ConversionOptions) -> ConversionResult:
     if project.bibliography_files and not references:
         report.warn("检测到 BibTeX 文件，但未能解析出参考文献条目。")
     postprocess_docx(output_file, project.metadata, report, references=references)
+    finalize_word_fields(output_file, report)
     report.generated_files.append(output_file)
     report.generated_files.append(report_file)
     report_file.write_text(report.to_markdown(), encoding="utf-8")

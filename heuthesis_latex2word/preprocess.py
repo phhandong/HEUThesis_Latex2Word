@@ -10,6 +10,29 @@ COVER_MARKER = "HEU_COVER_PLACEHOLDER"
 HEU_COVER_PLACEHOLDER = COVER_MARKER
 DECLARATION_MARKER = "HEU_DECLARATION_PLACEHOLDER"
 CITATION_PLACEHOLDER_RE = re.compile(r"HEU_CITE_(TEXT|SUPER)_([A-Za-z0-9_.-]+?)_END")
+EQUATION_MARKER_RE = re.compile(
+    r"^HEU_EQUATION_MARK_([A-Za-z0-9_.-]+)_END[\s\u25a1\u25fb\ufffd]*$"
+)
+EQUATION_REF_PLACEHOLDER_RE = re.compile(
+    r"HEU_EQREF_(PLAIN|PAREN)_([A-Za-z0-9_-]+?)_END"
+)
+
+_VERBATIM_BLOCK_RE = re.compile(
+    r"\\begin\{(?P<env>lstlisting|verbatim|Verbatim|minted)\}.*?"
+    r"\\end\{(?P=env)\}",
+    flags=re.S,
+)
+_INLINE_VERBATIM_RE = re.compile(
+    r"\\(?:verb\*?|lstinline(?:\[[^\]]*\])?)(?P<delimiter>[^A-Za-z0-9\s])"
+    r".*?(?P=delimiter)",
+    flags=re.S,
+)
+_NUMBERED_EQUATION_RE = re.compile(
+    r"\\begin\{(?P<env>equation|align|gather|multline)\}"
+    r"(?P<body>.*?)"
+    r"\\end\{(?P=env)\}",
+    flags=re.S,
+)
 
 
 def _latex_escape(text: str) -> str:
@@ -95,6 +118,148 @@ def _citation_slug(keys: str) -> str:
     return ".".join(encoded)
 
 
+def _marker_token(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _balanced_group(text: str, start: int, opening: str, closing: str) -> tuple[str, int] | None:
+    if start >= len(text) or text[start] != opening:
+        return None
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : index], index + 1
+    return None
+
+
+def _strip_textcolor_commands(text: str) -> str:
+    command = r"\textcolor"
+    search_from = 0
+    while True:
+        start = text.find(command, search_from)
+        if start < 0:
+            return text
+        cursor = start + len(command)
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor < len(text) and text[cursor] == "[":
+            option = _balanced_group(text, cursor, "[", "]")
+            if option is None:
+                search_from = cursor + 1
+                continue
+            _, cursor = option
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+        else:
+            # Pandoc understands ordinary named colors.  Only the optional
+            # color-model form (for example ``\textcolor[rgb]``) needs the
+            # fallback used for Word math conversion.
+            search_from = cursor
+            continue
+        color = _balanced_group(text, cursor, "{", "}")
+        if color is None:
+            search_from = cursor + 1
+            continue
+        _, cursor = color
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        content = _balanced_group(text, cursor, "{", "}")
+        if content is None:
+            search_from = cursor + 1
+            continue
+        replacement, end = content
+        text = text[:start] + replacement + text[end:]
+        search_from = start + len(replacement)
+
+
+def _normalize_pandoc_math_commands(text: str) -> str:
+    text = re.sub(r"\\textnormal\s*\{", r"\\text{", text)
+    text = re.sub(
+        r"\\underleftrightarrow\s*\{([^{}]+)\}",
+        r"\\underset{\\leftrightarrow}{\1}",
+        text,
+    )
+    text = re.sub(
+        r"\\underleftarrow\s*\{([^{}]+)\}",
+        r"\\underset{\\leftarrow}{\1}",
+        text,
+    )
+    text = re.sub(
+        r"\\underrightarrow\s*\{([^{}]+)\}",
+        r"\\underset{\\rightarrow}{\1}",
+        text,
+    )
+    text = re.sub(r"\\Bigm\s*\|", r"\\mid ", text)
+    text = re.sub(r"\\rm\s*\{", r"\\mathrm{", text)
+    return _strip_textcolor_commands(text)
+
+
+def _prepare_pandoc_math(text: str) -> str:
+    chunks: list[tuple[bool, str]] = []
+    position = 0
+    protected_matches = sorted(
+        [*_VERBATIM_BLOCK_RE.finditer(text), *_INLINE_VERBATIM_RE.finditer(text)],
+        key=lambda match: match.start(),
+    )
+    protected_end = -1
+    for match in protected_matches:
+        if match.start() < protected_end:
+            continue
+        if match.start() > position:
+            chunks.append((False, text[position : match.start()]))
+        chunks.append((True, match.group(0)))
+        position = match.end()
+        protected_end = match.end()
+    if position < len(text):
+        chunks.append((False, text[position:]))
+
+    equation_labels: set[str] = set()
+    prepared: list[tuple[bool, str]] = []
+
+    def mark_equation(match: re.Match[str]) -> str:
+        env = match.group("env")
+        body = match.group("body")
+        labels = re.findall(r"\\label\{([^{}]+)\}", body)
+        equation_labels.update(labels)
+        body = re.sub(r"\\label\{[^{}]+\}", "", body)
+        tokens = ".".join(_marker_token(label) for label in labels) or "NONE"
+        return (
+            rf"\begin{{{env}}}{body}\end{{{env}}}"
+            "\n\n"
+            f"HEU_EQUATION_MARK_{tokens}_END"
+            "\n\n"
+        )
+
+    for is_verbatim, chunk in chunks:
+        if not is_verbatim:
+            chunk = _normalize_pandoc_math_commands(chunk)
+            chunk = _NUMBERED_EQUATION_RE.sub(mark_equation, chunk)
+        prepared.append((is_verbatim, chunk))
+
+    def replace_equation_ref(match: re.Match[str]) -> str:
+        command, label = match.group(1), match.group(2)
+        if label not in equation_labels:
+            return match.group(0)
+        kind = "PAREN" if command == "eqref" else "PLAIN"
+        return f"HEU_EQREF_{kind}_{_marker_token(label)}_END"
+
+    result: list[str] = []
+    for is_verbatim, chunk in prepared:
+        if not is_verbatim:
+            chunk = re.sub(
+                r"\\(eqref|ref)\{([^{}]+)\}",
+                replace_equation_ref,
+                chunk,
+            )
+        result.append(chunk)
+    return "".join(result)
+
+
 def _replace_citations(text: str) -> str:
     def text_cite(match: re.Match[str]) -> str:
         return f"HEU_CITE_TEXT_{_citation_slug(match.group(1))}_END"
@@ -172,4 +337,5 @@ def _resolve_graphics_extensions(text: str, resource_paths: list[Path]) -> str:
 
 def make_pandoc_latex(project: ExpandedLatexProject, include_auth_scan: Path | None = None) -> str:
     text = _resolve_graphics_extensions(project.latex, project.resource_paths)
-    return _neutralize_heu_macros(text, project.metadata, include_auth_scan)
+    text = _neutralize_heu_macros(text, project.metadata, include_auth_scan)
+    return _prepare_pandoc_math(text)

@@ -17,7 +17,12 @@ from docx.text.paragraph import Paragraph
 
 from .bibliography import ReferenceEntry
 from .latex_parser import ThesisMetadata
-from .preprocess import CITATION_PLACEHOLDER_RE, HEU_COVER_PLACEHOLDER
+from .preprocess import (
+    CITATION_PLACEHOLDER_RE,
+    EQUATION_MARKER_RE,
+    EQUATION_REF_PLACEHOLDER_RE,
+    HEU_COVER_PLACEHOLDER,
+)
 from .report import ConversionReport
 
 
@@ -107,6 +112,7 @@ HEU_STYLES = {
     "cover_meta": "封面信息",
     "cover_small": "封面小字",
 }
+TOC_STYLE_NAMES = ("toc 1", "toc 2", "toc 3")
 LEGACY_HEU_STYLE_NAMES = {
     "HEU Body",
     "HEU Body Inline Math",
@@ -127,7 +133,7 @@ KEEP_CUSTOM_STYLE_NAMES = set(HEU_STYLES.values()) | {
     "封面2号黑体英文论文名称",
     "英文扉页姓名信息",
     "原创性声明内容样式",
-}
+} | set(TOC_STYLE_NAMES)
 
 
 def _set_run_font(run, font_cn: str, font_en: str, size_pt: float, bold: bool | None = None) -> None:
@@ -260,7 +266,7 @@ def _set_style_exact_line_layout(
     style.paragraph_format.space_after = Pt(space_after_pt)
 
 
-def _add_field(paragraph, instruction: str, fallback: str = "1") -> None:
+def _add_field(paragraph, instruction: str, fallback: str = "1"):
     run = paragraph.add_run()
     fld_begin = OxmlElement("w:fldChar")
     fld_begin.set(qn("w:fldCharType"), "begin")
@@ -283,6 +289,7 @@ def _add_field(paragraph, instruction: str, fallback: str = "1") -> None:
     fld_end = OxmlElement("w:fldChar")
     fld_end.set(qn("w:fldCharType"), "end")
     run._r.append(fld_end)
+    return run
 
 
 def _add_ref_field(paragraph, bookmark: str, fallback: str):
@@ -314,6 +321,28 @@ def _add_ref_field(paragraph, bookmark: str, fallback: str):
 def _clear_paragraph(paragraph) -> None:
     for run in list(paragraph.runs):
         paragraph._p.remove(run._r)
+
+
+def _get_or_add_paragraph_properties(element):
+    ppr = element.find(qn("w:pPr"))
+    if ppr is None:
+        ppr = OxmlElement("w:pPr")
+        element.insert(0, ppr)
+    return ppr
+
+
+def _set_keep_next(element, enabled: bool = True) -> None:
+    ppr = _get_or_add_paragraph_properties(element)
+    _remove_child(ppr, "w:keepNext")
+    if enabled:
+        ppr.append(OxmlElement("w:keepNext"))
+
+
+def _set_keep_lines(element, enabled: bool = True) -> None:
+    ppr = _get_or_add_paragraph_properties(element)
+    _remove_child(ppr, "w:keepLines")
+    if enabled:
+        ppr.append(OxmlElement("w:keepLines"))
 
 
 def _reset_cover_field_indent(paragraph) -> None:
@@ -874,6 +903,23 @@ def _style(doc: Document, name: str, base: str = "Normal"):
     return style
 
 
+def _toc_style(doc: Document, level: int):
+    style_id = f"TOC{level}"
+    style = next((item for item in doc.styles if item.style_id == style_id), None)
+    if style is None:
+        # python-docx gives this the reserved TOC styleId; removing
+        # customStyle makes Word treat it as the corresponding built-in style
+        # instead of renaming it and creating a second default TOC style.
+        style = _style(doc, f"TOC {level}")
+    style._element.attrib.pop(qn("w:customStyle"), None)
+    name = style._element.find(qn("w:name"))
+    if name is None:
+        name = OxmlElement("w:name")
+        style._element.insert(0, name)
+    name.set(qn("w:val"), f"toc {level}")
+    return style
+
+
 def _show_style_in_gallery(style, priority: int) -> None:
     element = style._element
     _remove_child(element, "w:semiHidden")
@@ -1118,6 +1164,21 @@ def _decode_citation_token(token: str) -> list[str]:
     return keys
 
 
+def _decode_marker_token(token: str) -> str | None:
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _equation_bookmark_name(label: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_]", "_", label)
+    if not safe or safe[0].isdigit():
+        safe = f"eq_{safe}"
+    return f"HEU_EQ_{safe[:32]}"
+
+
 def _format_sections(doc: Document) -> None:
     doc.settings.odd_and_even_pages_header_footer = True
     for section in doc.sections:
@@ -1146,6 +1207,7 @@ def _format_styles(doc: Document) -> None:
     _style(doc, HEU_STYLES["cover_title"])
     _style(doc, HEU_STYLES["cover_meta"])
     _style(doc, HEU_STYLES["cover_small"])
+    toc_styles = [_toc_style(doc, level) for level in range(1, 4)]
     for legacy_name in LEGACY_HEU_STYLE_NAMES:
         if legacy_name in styles:
             _hide_style_from_gallery(styles[legacy_name])
@@ -1175,6 +1237,8 @@ def _format_styles(doc: Document) -> None:
         (HEU_STYLES["subsubsection"], 3),
     ):
         _set_style_outline_level(styles[style_name], outline_level)
+        styles[style_name].paragraph_format.keep_with_next = True
+        styles[style_name].paragraph_format.keep_together = True
 
     for name in ("Normal", "Body Text", "First Paragraph"):
         if name in styles:
@@ -1303,6 +1367,32 @@ def _format_styles(doc: Document) -> None:
         space_before_pt=0,
         space_after_pt=0,
     )
+
+    toc1, toc2, toc3 = toc_styles
+    _set_style_font(toc1, "黑体", "Times New Roman", BODY_SIZE_PT, False)
+    _set_style_single_line_layout(
+        toc1,
+        alignment=WD_ALIGN_PARAGRAPH.LEFT,
+        first_line_indent_pt=0,
+        space_before_pt=6,
+        space_after_pt=6,
+    )
+    toc1.paragraph_format.left_indent = Pt(0)
+    toc1.paragraph_format.right_indent = Pt(0)
+
+    for style, left_indent_pt in ((toc2, 24), (toc3, 48)):
+        _set_style_font(style, "宋体", "Times New Roman", BODY_SIZE_PT, False)
+        _set_style_paragraph_layout(
+            style,
+            alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
+            first_line_indent_pt=0,
+            line_spacing_pt=22,
+            space_before_pt=0,
+            space_after_pt=0,
+        )
+        style.paragraph_format.left_indent = Pt(left_indent_pt)
+        style.paragraph_format.right_indent = Pt(0)
+
     _set_style_font(styles[HEU_STYLES["figure"]], "宋体", "Times New Roman", BODY_SIZE_PT, False)
     _set_style_exact_line_layout(
         styles[HEU_STYLES["figure"]],
@@ -1370,6 +1460,37 @@ def _center_header_footer_paragraph(paragraph) -> None:
     paragraph.paragraph_format.space_after = Pt(0)
 
 
+def _set_header_decoration_line(paragraph) -> None:
+    """Match the HEU header's compound double paragraph border."""
+    ppr = paragraph._p.get_or_add_pPr()
+    _remove_child(ppr, "w:pBdr")
+
+    borders = OxmlElement("w:pBdr")
+    for edge in ("top", "left", "bottom", "right"):
+        border = OxmlElement(f"w:{edge}")
+        border.set(qn("w:val"), "thickThinSmallGap" if edge == "bottom" else "none")
+        border.set(qn("w:sz"), "24" if edge == "bottom" else "0")
+        border.set(qn("w:space"), "1" if edge == "bottom" else "0")
+        border.set(qn("w:color"), "auto")
+        borders.append(border)
+
+    ppr.insert_element_before(
+        borders,
+        "w:shd",
+        "w:tabs",
+        "w:spacing",
+        "w:ind",
+        "w:contextualSpacing",
+        "w:jc",
+        "w:textDirection",
+        "w:textAlignment",
+        "w:outlineLvl",
+        "w:rPr",
+        "w:sectPr",
+        "w:pPrChange",
+    )
+
+
 def _format_headers_and_footers(doc: Document, metadata: ThesisMetadata) -> None:
     school_line = f"哈尔滨工程大学{metadata.degree_label}学位论文"
     section_titles = [
@@ -1398,6 +1519,7 @@ def _format_headers_and_footers(doc: Document, metadata: ThesisMetadata) -> None
             for header in (section.header, section.even_page_header, section.first_page_header):
                 para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
                 _clear_paragraph(para)
+                _remove_child(para._p.get_or_add_pPr(), "w:pBdr")
             for footer in (section.footer, section.even_page_footer, section.first_page_footer):
                 para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
                 _clear_paragraph(para)
@@ -1422,6 +1544,7 @@ def _format_headers_and_footers(doc: Document, metadata: ThesisMetadata) -> None
             para.add_run(school_line)
         for run in para.runs:
             _set_run_font(run, "宋体", "Times New Roman", 10.5, False)
+        _set_header_decoration_line(para)
 
         even_header = section.even_page_header
         para = even_header.paragraphs[0] if even_header.paragraphs else even_header.add_paragraph()
@@ -1429,6 +1552,7 @@ def _format_headers_and_footers(doc: Document, metadata: ThesisMetadata) -> None
         _center_header_footer_paragraph(para)
         run = para.add_run(school_line)
         _set_run_font(run, "宋体", "Times New Roman", 10.5, False)
+        _set_header_decoration_line(para)
 
         for footer in (section.footer, section.even_page_footer):
             para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
@@ -2121,6 +2245,236 @@ def _format_paragraphs(doc: Document, report: ConversionReport | None = None) ->
         )
 
 
+def _append_tab(paragraph) -> None:
+    run = paragraph.add_run()
+    run._r.append(OxmlElement("w:tab"))
+
+
+def _set_equation_tabs(paragraph) -> None:
+    ppr = paragraph._p.get_or_add_pPr()
+    _remove_child(ppr, "w:tabs")
+    tabs = OxmlElement("w:tabs")
+    for alignment, position in (("center", 4536), ("right", 9072)):
+        tab = OxmlElement("w:tab")
+        tab.set(qn("w:val"), alignment)
+        tab.set(qn("w:leader"), "none")
+        tab.set(qn("w:pos"), str(position))
+        tabs.append(tab)
+    ppr.insert_element_before(
+        tabs,
+        "w:spacing",
+        "w:ind",
+        "w:jc",
+        "w:textDirection",
+        "w:textAlignment",
+        "w:outlineLvl",
+        "w:rPr",
+        "w:sectPr",
+        "w:pPrChange",
+    )
+
+
+def _bookmark_equation_number(
+    paragraph,
+    start_run,
+    end_run,
+    labels: list[str],
+    bookmark_id: int,
+) -> int:
+    for label in labels:
+        start = OxmlElement("w:bookmarkStart")
+        start.set(qn("w:id"), str(bookmark_id))
+        start.set(qn("w:name"), _equation_bookmark_name(label))
+        end = OxmlElement("w:bookmarkEnd")
+        end.set(qn("w:id"), str(bookmark_id))
+        start_run._r.addprevious(start)
+        end_run._r.addnext(end)
+        bookmark_id += 1
+    return bookmark_id
+
+
+def _format_numbered_equation(
+    paragraph,
+    *,
+    chapter_no: int,
+    equation_no: int,
+    labels: list[str],
+    bookmark_id: int,
+) -> int:
+    math_para = paragraph._p.find(qn("m:oMathPara"))
+    if math_para is None:
+        return bookmark_id
+    maths = [deepcopy(element) for element in math_para.findall(qn("m:oMath"))]
+    paragraph._p.remove(math_para)
+    _set_equation_tabs(paragraph)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    _append_tab(paragraph)
+    for math in maths:
+        paragraph._p.append(math)
+    _append_tab(paragraph)
+
+    opening = paragraph.add_run("(")
+    prefix = paragraph.add_run(f"{chapter_no}-")
+    sequence = _add_field(
+        paragraph,
+        f" SEQ HEUEquation{chapter_no} \\* ARABIC ",
+        str(equation_no),
+    )
+    suffix = paragraph.add_run(")")
+    for run in (opening, prefix, sequence, suffix):
+        _set_run_font(run, "宋体", "Times New Roman", BODY_SIZE_PT, False)
+    return _bookmark_equation_number(
+        paragraph,
+        prefix,
+        sequence,
+        labels,
+        bookmark_id,
+    )
+
+
+def _number_equations(doc: Document, report: ConversionReport | None = None) -> dict[str, str]:
+    paragraphs = list(doc.paragraphs)
+    current_chapter = 0
+    equation_counts: dict[int, int] = {}
+    equation_numbers: dict[str, str] = {}
+    bookmark_id = _next_bookmark_id(doc)
+    numbered = 0
+    orphan_markers = 0
+
+    for index, paragraph in enumerate(paragraphs):
+        text = paragraph.text.strip()
+        chapter_match = CHAPTER_PREFIX_RE.match(text)
+        if chapter_match:
+            value = chapter_match.group(1)
+            current_chapter = int(value) if value.isdigit() else current_chapter + 1
+            continue
+        if not _paragraph_has_display_math(paragraph):
+            continue
+        if index + 1 >= len(paragraphs):
+            continue
+        marker_paragraph = paragraphs[index + 1]
+        marker_match = EQUATION_MARKER_RE.match(marker_paragraph.text.strip())
+        if marker_match is None:
+            continue
+
+        chapter_no = max(current_chapter, 1)
+        equation_no = equation_counts.get(chapter_no, 0) + 1
+        equation_counts[chapter_no] = equation_no
+        token_blob = marker_match.group(1)
+        labels = [
+            label
+            for token in token_blob.split(".")
+            if token != "NONE" and (label := _decode_marker_token(token))
+        ]
+        bookmark_id = _format_numbered_equation(
+            paragraph,
+            chapter_no=chapter_no,
+            equation_no=equation_no,
+            labels=labels,
+            bookmark_id=bookmark_id,
+        )
+        for label in labels:
+            equation_numbers[label] = f"{chapter_no}-{equation_no}"
+        _remove_paragraph(marker_paragraph)
+        numbered += 1
+
+    for paragraph in list(doc.paragraphs):
+        if EQUATION_MARKER_RE.match(paragraph.text.strip()):
+            orphan_markers += 1
+            _remove_paragraph(paragraph)
+
+    if report and numbered:
+        report.note(f"已添加按章公式编号 {numbered} 个。")
+    if report and orphan_markers:
+        report.warn(f"有 {orphan_markers} 个公式编号标记未匹配到可编辑 Word 公式。")
+    return equation_numbers
+
+
+def _replace_equation_reference_placeholders(
+    doc: Document,
+    equation_numbers: dict[str, str],
+    report: ConversionReport | None = None,
+) -> None:
+    replaced = 0
+    unresolved: set[str] = set()
+    for paragraph in doc.paragraphs:
+        text = paragraph.text
+        if "HEU_EQREF_" not in text:
+            continue
+        parts: list[str | tuple[str, str]] = []
+        position = 0
+        for match in EQUATION_REF_PLACEHOLDER_RE.finditer(text):
+            if match.start() > position:
+                parts.append(text[position : match.start()])
+            kind, token = match.group(1), match.group(2)
+            label = _decode_marker_token(token)
+            if label is not None:
+                parts.append((kind, label))
+            position = match.end()
+        if position < len(text):
+            parts.append(text[position:])
+        if not parts:
+            continue
+
+        _clear_paragraph(paragraph)
+        for part in parts:
+            if isinstance(part, str):
+                if part:
+                    run = paragraph.add_run(part)
+                    _set_run_font(run, "宋体", "Times New Roman", BODY_SIZE_PT, None)
+                continue
+            kind, label = part
+            fallback = equation_numbers.get(label, "?")
+            if label not in equation_numbers:
+                unresolved.add(label)
+            if kind == "PAREN":
+                run = paragraph.add_run("(")
+                _set_run_font(run, "宋体", "Times New Roman", BODY_SIZE_PT, None)
+            field = _add_field(
+                paragraph,
+                f" REF {_equation_bookmark_name(label)} \\h ",
+                fallback,
+            )
+            _set_run_font(field, "宋体", "Times New Roman", BODY_SIZE_PT, None)
+            if kind == "PAREN":
+                run = paragraph.add_run(")")
+                _set_run_font(run, "宋体", "Times New Roman", BODY_SIZE_PT, None)
+            replaced += 1
+
+    if report and replaced:
+        report.note(f"已将 {replaced} 处公式引用替换为 Word REF 域。")
+    if report and unresolved:
+        report.warn("未解析的公式引用: " + "、".join(sorted(unresolved)))
+
+
+def _keep_figures_with_captions(doc: Document, report: ConversionReport | None = None) -> None:
+    linked = 0
+    for caption in doc.paragraphs:
+        style_name = caption.style.name if caption.style else ""
+        if style_name != HEU_STYLES["caption"]:
+            continue
+        previous = caption._p.getprevious()
+        while previous is not None and previous.tag not in {qn("w:p"), qn("w:tbl")}:
+            previous = previous.getprevious()
+        if previous is None:
+            continue
+        if previous.tag == qn("w:p") and previous.find(".//" + qn("w:drawing")) is not None:
+            _set_keep_next(previous)
+            _set_keep_lines(previous)
+            linked += 1
+        elif previous.tag == qn("w:tbl") and previous.find(".//" + qn("w:drawing")) is not None:
+            rows = previous.findall(qn("w:tr"))
+            if rows:
+                for image_paragraph in rows[-1].findall(".//" + qn("w:p")):
+                    _set_keep_next(image_paragraph)
+                    _set_keep_lines(image_paragraph)
+                linked += 1
+        _set_keep_lines(caption._p)
+    if report and linked:
+        report.note(f"已绑定图片与题注同页 {linked} 组。")
+
+
 def _has_meaningful_content_before(paragraph) -> bool:
     parent = paragraph._p.getparent()
     index = parent.index(paragraph._p)
@@ -2182,18 +2536,8 @@ def _insert_page_section_breaks(doc: Document, report: ConversionReport | None =
         elif decimal_started:
             _set_section_page_numbering(sect_pr, "decimal", None)
 
-    for para in list(doc.paragraphs):
-        if para.text.strip() not in PUBLICATION_SECTION_TITLES:
-            continue
-        if not _has_meaningful_content_before(para) or _has_previous_section_break(para):
-            continue
-        sect_pr = _ensure_section_break_before(para, "nextPage")
-        if sect_pr is not None and decimal_started:
-            _set_section_page_numbering(sect_pr, "decimal", None)
-        normal_breaks += 1
-
     if report and (odd_breaks or normal_breaks):
-        report.note(f"已插入分页控制：章标题奇数页 {odd_breaks} 处，前置/成果标题新页 {normal_breaks} 处，并设置前置罗马页码与正文阿拉伯页码。")
+        report.note(f"已插入分页控制：章标题奇数页 {odd_breaks} 处，前置标题新页 {normal_breaks} 处，并设置前置罗马页码与正文阿拉伯页码。")
 
 
 def _set_border(parent, edge: str, *, val: str, size_eighths_pt: int = 0) -> None:
@@ -2301,9 +2645,12 @@ def postprocess_docx(
     _replace_placeholders(doc, report, references=references)
     _replace_citation_placeholders(doc, references, report)
     _format_paragraphs(doc, report)
+    equation_numbers = _number_equations(doc, report)
+    _replace_equation_reference_placeholders(doc, equation_numbers, report)
     _format_tables(doc)
     _insert_page_section_breaks(doc, report)
     _convert_images_to_top_bottom_wrap(doc, report)
+    _keep_figures_with_captions(doc, report)
     if not _replace_marker_with_template(
         doc,
         COVER_MARKER,

@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 
 from docx import Document
@@ -17,13 +18,17 @@ from heuthesis_latex2word.postprocess import (
     _format_styles,
     _format_tables,
     _insert_page_section_breaks,
+    _keep_figures_with_captions,
     _normalize_pandoc_custom_styles,
+    _number_equations,
     _remove_unrelated_custom_styles,
+    _replace_equation_reference_placeholders,
     postprocess_docx,
 )
 from heuthesis_latex2word.preprocess import (
     COVER_MARKER,
     DECLARATION_MARKER,
+    _prepare_pandoc_math,
     build_declaration_latex,
     make_pandoc_latex,
 )
@@ -115,6 +120,38 @@ c=d
     assert "a=b\nc=d" in normalized
     assert "\\item 列表项\n下一段" in normalized
     assert count == 1
+
+
+def test_prepare_pandoc_math_preserves_code_and_marks_equation_references():
+    latex = r"""
+普通颜色：\textcolor{red}{红色}。
+行内公式 $\textnormal{刚度}=\underleftrightarrow{a}+\underleftarrow{b}+\underrightarrow{c}$，代码 \verb|\underleftrightarrow|。
+式(\ref{eq:sample})，另见 \eqref{eq:sample}。
+\begin{equation}\label{eq:sample}
+  \textcolor[rgb]{0,0,1}{x \Bigm| y}
+\end{equation}
+\begin{lstlisting}
+\textnormal{code}\textcolor[rgb]{0,0,1}{code}\Bigm|
+\end{lstlisting}
+"""
+
+    prepared = _prepare_pandoc_math(latex)
+
+    assert r"\textcolor{red}{红色}" in prepared
+    assert r"\text{刚度}" in prepared
+    assert r"\underset{\leftrightarrow}{a}" in prepared
+    assert r"\underset{\leftarrow}{b}" in prepared
+    assert r"\underset{\rightarrow}{c}" in prepared
+    assert r"\verb|\underleftrightarrow|" in prepared
+    assert r"x \mid" in prepared
+    assert r"\textcolor[rgb]{0,0,1}{x" not in prepared
+    assert "HEU_EQUATION_MARK_" in prepared
+    assert "HEU_EQREF_PLAIN_" in prepared
+    assert "HEU_EQREF_PAREN_" in prepared
+    marker_end = prepared.index("_END", prepared.index("HEU_EQUATION_MARK_"))
+    assert prepared[marker_end + 4 :].lstrip("\n").startswith(r"\begin{lstlisting}")
+    assert prepared[marker_end + 4 :].startswith("\n\n")
+    assert r"\textnormal{code}\textcolor[rgb]{0,0,1}{code}\Bigm|" in prepared
 
 
 def test_postprocess_adds_cover_styles_bookmarks_and_ref_fields(tmp_path):
@@ -242,6 +279,7 @@ def test_body_odd_header_uses_chapter_and_even_header_uses_school_line():
 
     _format_sections(doc)
     _format_headers_and_footers(doc, project.metadata)
+    _format_headers_and_footers(doc, project.metadata)
 
     school_line = "哈尔滨工程大学工程硕士学位论文"
     assert doc.settings.odd_and_even_pages_header_footer is True
@@ -254,6 +292,36 @@ def test_body_odd_header_uses_chapter_and_even_header_uses_school_line():
     assert abstract_odd.paragraph_format.first_line_indent.pt == 0
     assert abstract_odd.paragraph_format.left_indent.pt == 0
     assert abstract_odd.paragraph_format.right_indent.pt == 0
+    for header_paragraph in (
+        abstract_odd,
+        abstract_section.even_page_header.paragraphs[0],
+        body_section.header.paragraphs[0],
+        body_section.even_page_header.paragraphs[0],
+    ):
+        borders = header_paragraph._p.pPr.find(qn("w:pBdr"))
+        assert borders is not None
+        assert len(header_paragraph._p.pPr.findall(qn("w:pBdr"))) == 1
+        bottom = borders.find(qn("w:bottom"))
+        assert bottom.get(qn("w:val")) == "thickThinSmallGap"
+        assert bottom.get(qn("w:sz")) == "24"
+        assert bottom.get(qn("w:space")) == "1"
+        assert bottom.get(qn("w:color")) == "auto"
+        for edge in ("top", "left", "right"):
+            side = borders.find(qn(f"w:{edge}"))
+            assert side.get(qn("w:val")) == "none"
+            assert side.get(qn("w:sz")) == "0"
+            assert side.get(qn("w:space")) == "0"
+            assert side.get(qn("w:color")) == "auto"
+
+    for header in (
+        doc.sections[0].header,
+        doc.sections[0].even_page_header,
+        doc.sections[0].first_page_header,
+    ):
+        assert header.paragraphs[0]._p.pPr.find(qn("w:pBdr")) is None
+    for section in doc.sections:
+        for footer in (section.footer, section.even_page_footer, section.first_page_footer):
+            assert footer.paragraphs[0]._p.pPr.find(qn("w:pBdr")) is None
 
     odd_xml = body_section.header._element.xml
     assert 'STYLEREF "章标题" \\* MERGEFORMAT' in odd_xml
@@ -309,8 +377,82 @@ def test_postprocess_uses_styles_for_text_and_keeps_image_caption_tight():
     assert doc.styles["正文"]._element.find(qn("w:qFormat")) is not None
     assert doc.styles["章标题"]._element.find(qn("w:qFormat")) is not None
     assert doc.styles["图表题注"]._element.find(qn("w:qFormat")) is not None
+    assert doc.styles["toc 1"].style_id == "TOC1"
+    assert doc.styles["toc 1"].font.name == "Times New Roman"
+    assert doc.styles["toc 1"].paragraph_format.left_indent.pt == 0
+    assert doc.styles["toc 2"].paragraph_format.left_indent.pt == 24
+    assert doc.styles["toc 3"].paragraph_format.left_indent.pt == 48
+    assert qn("w:customStyle") not in doc.styles["toc 1"]._element.attrib
     assert heading.runs[0].font.size is None
     assert body.runs[0].font.size is None
+
+
+def test_numbered_equation_has_chapter_sequence_tabs_bookmark_and_ref():
+    label = "eq:sample"
+    token = base64.urlsafe_b64encode(label.encode("utf-8")).decode("ascii").rstrip("=")
+    doc = Document()
+    heading = doc.add_paragraph("公式")
+    heading.style = "Heading 1"
+    equation = doc.add_paragraph()
+    math_para = OxmlElement("m:oMathPara")
+    math = OxmlElement("m:oMath")
+    math_run = OxmlElement("m:r")
+    math_text = OxmlElement("m:t")
+    math_text.text = "x=y"
+    math_run.append(math_text)
+    math.append(math_run)
+    math_para.append(math)
+    equation._p.append(math_para)
+    marker = doc.add_paragraph(f"HEU_EQUATION_MARK_{token}_END\u00a0◻")
+    reference = doc.add_paragraph(f"如式(HEU_EQREF_PLAIN_{token}_END)所示。")
+
+    _format_styles(doc)
+    _format_paragraphs(doc)
+    equation_numbers = _number_equations(doc)
+    _replace_equation_reference_placeholders(doc, equation_numbers)
+
+    xml = doc._element.xml
+    assert marker._p.getparent() is None
+    assert equation_numbers == {label: "1-1"}
+    assert "HEU_EQUATION_MARK_" not in xml
+    assert "HEU_EQREF_" not in xml
+    assert "SEQ HEUEquation1" in xml
+    assert "REF HEU_EQ_eq_sample" in xml
+    assert 'w:name="HEU_EQ_eq_sample"' in xml
+    assert equation.text == "\t\t(1-1)"
+    assert equation._p.find(qn("m:oMath")) is not None
+    assert reference.text == "如式(1-1)所示。"
+    tabs = equation._p.pPr.find(qn("w:tabs"))
+    assert [(tab.get(qn("w:val")), tab.get(qn("w:pos"))) for tab in tabs] == [
+        ("center", "4536"),
+        ("right", "9072"),
+    ]
+
+
+def test_figure_caption_and_publication_heading_keep_with_following_content():
+    doc = Document()
+    achievement = doc.add_paragraph("攻读硕士学位期间发表的论文和取得的科研成果")
+    achievement.style = "Heading 1"
+    publication = doc.add_paragraph("（一）发表的相关论文")
+    publication.style = "Heading 2"
+    doc.add_paragraph("论文条目")
+    image = doc.add_paragraph()
+    image.add_run().add_picture(str(ROOT / "HeuThesis_Overleaf" / "heulogo.jpg"))
+    caption = doc.add_paragraph("校徽")
+    caption.style = "Caption"
+
+    _format_styles(doc)
+    _format_paragraphs(doc)
+    _insert_page_section_breaks(doc)
+    _keep_figures_with_captions(doc)
+
+    assert image._p.pPr.find(qn("w:keepNext")) is not None
+    assert image._p.pPr.find(qn("w:keepLines")) is not None
+    assert caption._p.pPr.find(qn("w:keepLines")) is not None
+    assert publication.style.paragraph_format.keep_with_next is True
+    previous = publication._p.getprevious()
+    assert previous is achievement._p
+    assert previous.find(qn("w:pPr") + "/" + qn("w:sectPr")) is None
 
 
 def test_front_matter_and_chapters_get_required_section_page_numbering():
