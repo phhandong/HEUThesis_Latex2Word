@@ -41,7 +41,9 @@ def _split_bib_fields(body: str) -> dict[str, str]:
             value.startswith('"') and value.endswith('"')
         ):
             value = value[1:-1]
-        fields[key.strip().lower()] = latex_to_plain(value)
+        plain_value = latex_to_plain(value)
+        plain_value = re.sub(r"(?<!\\)\$([^$]+)(?<!\\)\$", r"\1", plain_value)
+        fields[key.strip().lower()] = plain_value
     return fields
 
 
@@ -54,16 +56,24 @@ def parse_bibtex(path: Path) -> list[dict[str, str]]:
         match = pattern.search(text, pos)
         if not match:
             break
-        depth = 0
+        # The pattern has already consumed the entry's opening brace.  Keep
+        # that outer level in the depth count; otherwise the closing brace of
+        # the first braced field is mistaken for the end of the whole entry.
+        depth = 1
+        in_quote = False
         end = match.end()
-        for idx in range(match.end() - 1, len(text)):
-            if text[idx] == "{":
-                depth += 1
-            elif text[idx] == "}":
-                depth -= 1
-                if depth == 0:
-                    end = idx
-                    break
+        for idx in range(match.end(), len(text)):
+            ch = text[idx]
+            if ch == '"' and (idx == 0 or text[idx - 1] != "\\"):
+                in_quote = not in_quote
+            elif not in_quote:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx
+                        break
         body = text[match.end() : end]
         fields = _split_bib_fields(body)
         fields["_type"] = match.group(1).lower()
@@ -73,8 +83,18 @@ def parse_bibtex(path: Path) -> list[dict[str, str]]:
     return entries
 
 
-def format_reference(entry: dict[str, str], index: int) -> str:
+def _format_authors(entry: dict[str, str]) -> str:
     authors = entry.get("author") or entry.get("editor") or ""
+    names = [name.strip() for name in re.split(r"\s+and\s+", authors, flags=re.I) if name.strip()]
+    if len(names) <= 1:
+        return authors.strip()
+    language = entry.get("language", "").strip().lower()
+    separator = "，" if language.startswith(("zh", "chi")) else ", "
+    return separator.join(names)
+
+
+def format_reference(entry: dict[str, str], index: int) -> str:
+    authors = _format_authors(entry)
     title = entry.get("title", "")
     year = entry.get("year") or entry.get("date", "")
     journal = entry.get("journal") or entry.get("booktitle") or ""

@@ -10,6 +10,7 @@ from docx.oxml.ns import qn
 
 from heuthesis_latex2word.bibliography import ReferenceEntry
 from heuthesis_latex2word.bibliography import collect_references
+from heuthesis_latex2word.bibliography import parse_bibtex
 from heuthesis_latex2word.latex_parser import expand_project, normalize_soft_linebreaks, parse_heusetup
 from heuthesis_latex2word.postprocess import (
     _format_paragraphs,
@@ -17,6 +18,7 @@ from heuthesis_latex2word.postprocess import (
     _format_sections,
     _format_styles,
     _format_tables,
+    _create_reference_numbering,
     _insert_page_section_breaks,
     _keep_figures_with_captions,
     _normalize_pandoc_custom_styles,
@@ -28,7 +30,9 @@ from heuthesis_latex2word.postprocess import (
 from heuthesis_latex2word.preprocess import (
     COVER_MARKER,
     DECLARATION_MARKER,
+    GraphicsFallbackReport,
     _prepare_pandoc_math,
+    _resolve_graphics_extensions,
     build_declaration_latex,
     make_pandoc_latex,
 )
@@ -100,6 +104,141 @@ def test_collect_bibtex_references():
     assert refs[0].key
     assert refs[0].index == 1
     assert refs[0].text.startswith("[1]")
+    assert "武林高手从入门到精通" in refs[0].text
+    assert "第 N 次华山论剑" in refs[0].text
+    assert " and " not in refs[0].text
+    assert "林来兴" in refs[2].text
+    assert "空间控制技术" in refs[2].text
+    assert all(ref.text.removeprefix(f"[{ref.index}]").strip(" .") for ref in refs)
+
+
+def test_parse_bibtex_reads_past_first_braced_field(tmp_path):
+    bib = tmp_path / "sample.bib"
+    bib.write_text(
+        """@book{nested,
+  language = {zh},
+  title = {包含 {嵌套} 花括号的标题},
+  author = {甲 and 乙},
+  publisher = \"出版社, 总社\",
+  year = {2026}
+}
+""",
+        encoding="utf-8",
+    )
+
+    entries = parse_bibtex(bib)
+
+    assert len(entries) == 1
+    assert entries[0]["language"] == "zh"
+    assert entries[0]["title"] == "包含 嵌套 花括号的标题"
+    assert entries[0]["author"] == "甲 and 乙"
+    assert entries[0]["publisher"] == "出版社, 总社"
+    assert entries[0]["year"] == "2026"
+
+
+def test_eps_only_graphic_gets_generated_png_fallback(tmp_path):
+    figures = ROOT / "HeuThesis_Overleaf" / "examples" / "book" / "bachelor" / "figures"
+    report = GraphicsFallbackReport()
+
+    resolved = _resolve_graphics_extensions(
+        r"\includegraphics[width=4cm]{list}",
+        [figures],
+        generated_assets_dir=tmp_path / "graphics",
+        graphics_report=report,
+    )
+
+    assert resolved.endswith(".png}")
+    assert len(report.converted_eps) == 1
+    source, fallback = report.converted_eps[0]
+    assert source.name == "list.eps"
+    assert fallback.exists()
+    assert fallback.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert report.unresolved_eps == []
+
+
+def test_explicit_eps_prefers_existing_compatible_fallback(tmp_path):
+    figures = tmp_path / "figures"
+    figures.mkdir()
+    (figures / "diagram.eps").write_bytes(b"unsupported EPS")
+    compatible = figures / "diagram.png"
+    compatible.write_bytes(b"\x89PNG\r\n\x1a\nexisting")
+    report = GraphicsFallbackReport()
+
+    resolved = _resolve_graphics_extensions(
+        r"\includegraphics{diagram.eps}",
+        [figures],
+        generated_assets_dir=tmp_path / "generated",
+        graphics_report=report,
+    )
+
+    assert resolved == rf"\includegraphics{{{compatible.resolve().as_posix()}}}"
+    assert report.converted_eps == []
+    assert report.unresolved_eps == []
+
+
+def test_unsupported_eps_is_preserved_and_reported(tmp_path):
+    figures = tmp_path / "figures"
+    figures.mkdir()
+    source = figures / "diagram.eps"
+    source.write_bytes(b"%!PS-Adobe-3.0 EPSF-3.0\n%%EOF\n")
+    report = GraphicsFallbackReport()
+
+    resolved = _resolve_graphics_extensions(
+        r"\includegraphics{diagram}",
+        [figures],
+        generated_assets_dir=tmp_path / "generated",
+        graphics_report=report,
+    )
+
+    assert resolved == r"\includegraphics{diagram.eps}"
+    assert report.converted_eps == []
+    assert report.unresolved_eps == [source]
+    assert not (tmp_path / "generated").exists()
+
+
+def test_graphics_resolution_keeps_resource_path_precedence(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "diagram.pdf").write_bytes(b"first resource")
+    (second / "diagram.png").write_bytes(b"second resource")
+
+    resolved = _resolve_graphics_extensions(
+        r"\includegraphics{diagram}",
+        [first, second],
+    )
+
+    assert resolved == r"\includegraphics{diagram.pdf}"
+
+
+def test_reference_numbering_keeps_abstracts_before_instances():
+    doc = Document()
+    numbering = doc.part.numbering_part.element
+    cleanup = OxmlElement("w:numIdMacAtCleanup")
+    cleanup.set(qn("w:val"), "1")
+    numbering.append(cleanup)
+    existing_num_ids = {
+        element.get(qn("w:numId")) for element in numbering.findall(qn("w:num"))
+    }
+
+    new_num_id = _create_reference_numbering(doc)
+
+    children = list(numbering)
+    abstract_positions = [
+        index for index, child in enumerate(children) if child.tag == qn("w:abstractNum")
+    ]
+    instance_positions = [
+        index for index, child in enumerate(children) if child.tag == qn("w:num")
+    ]
+    cleanup_position = children.index(cleanup)
+    defined_num_ids = {
+        element.get(qn("w:numId")) for element in numbering.findall(qn("w:num"))
+    }
+    assert max(abstract_positions) < min(instance_positions)
+    assert max(instance_positions) < cleanup_position
+    assert existing_num_ids < defined_num_ids
+    assert str(new_num_id) in defined_num_ids
 
 
 def test_normalize_soft_linebreaks_keeps_structural_boundaries():
@@ -486,7 +625,7 @@ def test_front_matter_and_chapters_get_required_section_page_numbering():
     assert 'w:pgNumType w:fmt="decimal" w:start="1"' in xml
 
 
-def test_inline_math_body_uses_single_line_spacing_style():
+def test_inline_math_body_uses_exact_body_line_spacing_style():
     doc = Document()
     para = doc.add_paragraph("含公式的正文")
     para._p.append(OxmlElement("m:oMath"))
@@ -495,7 +634,8 @@ def test_inline_math_body_uses_single_line_spacing_style():
     _format_paragraphs(doc)
 
     assert para.style.name == "正文（内嵌公式）"
-    assert para.style.paragraph_format.line_spacing == 1.0
+    assert para.style.paragraph_format.line_spacing_rule == WD_LINE_SPACING.EXACTLY
+    assert para.style.paragraph_format.line_spacing.pt == 20.5
 
 
 def test_image_table_borders_are_removed():
@@ -508,9 +648,32 @@ def test_image_table_borders_are_removed():
     _format_tables(doc)
 
     xml = table._tbl.xml
+    assert table.style.name == "FigureTable"
     assert 'w:val="single"' not in xml
     assert xml.count('w:val="nil"') >= 6
     assert {cell.paragraphs[0].style.name for cell in table.rows[0].cells} == {"图片"}
+
+
+def test_empty_figure_layout_tables_are_removed_without_touching_regular_empty_tables():
+    doc = Document()
+    _format_styles(doc)
+    regular_empty = doc.add_table(rows=1, cols=1)
+    doc.add_paragraph("普通表格后的正文")
+    caption = doc.add_paragraph("图 1.1 示例")
+    caption.style = "图表题注"
+    empty_figure = doc.add_table(rows=1, cols=2)
+    populated_figure = doc.add_table(rows=1, cols=2)
+    populated_figure.cell(0, 0).text = "(a) 子图"
+    trailing_caption = doc.add_paragraph("图 1.2 组合图")
+    trailing_caption.style = "图表题注"
+
+    _format_tables(doc)
+
+    assert regular_empty._tbl.getparent() is not None
+    assert empty_figure._tbl.getparent() is None
+    assert populated_figure._tbl.getparent() is not None
+    assert populated_figure.style.name == "FigureTable"
+    assert 'w:val="single"' not in populated_figure._tbl.xml
 
 
 def test_unrelated_custom_styles_are_removed_and_legacy_heu_styles_hidden():

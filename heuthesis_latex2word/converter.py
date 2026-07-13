@@ -9,7 +9,7 @@ from pathlib import Path
 from .latex_parser import expand_project
 from .bibliography import collect_references
 from .postprocess import postprocess_docx
-from .preprocess import make_pandoc_latex
+from .preprocess import GraphicsFallbackReport, make_pandoc_latex
 from .report import ConversionReport
 from .word_finalize import finalize_word_fields
 
@@ -100,11 +100,22 @@ def convert_project(options: ConversionOptions) -> ConversionResult:
         report.note(f"已智能合并 LaTeX 正文软换行 {project.soft_linebreaks_merged} 处。")
 
     with tempfile.TemporaryDirectory(prefix="heuthesis_l2w_") as tmp:
-        temp_latex = Path(tmp) / "pandoc_input.tex"
+        temp_dir = Path(tmp)
+        temp_latex = temp_dir / "pandoc_input.tex"
+        graphics_report = GraphicsFallbackReport()
         temp_latex.write_text(
-            make_pandoc_latex(project, include_auth_scan=options.include_auth_scan),
+            make_pandoc_latex(
+                project,
+                include_auth_scan=options.include_auth_scan,
+                generated_assets_dir=temp_dir / "graphics",
+                graphics_report=graphics_report,
+            ),
             encoding="utf-8",
         )
+        for source, _target in graphics_report.converted_eps:
+            report.note(f"已将 EPS 转换为 PNG 兼容后备图：{source}")
+        for source in graphics_report.unresolved_eps:
+            report.warn(f"EPS 图片无法生成兼容后备图，部分 Word 环境可能显示为空白：{source}")
         _run_pandoc(
             temp_latex=temp_latex,
             output_file=output_file,

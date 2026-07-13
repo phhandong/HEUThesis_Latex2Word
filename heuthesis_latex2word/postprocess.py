@@ -48,6 +48,7 @@ CAPTION_SIZE_PT = 10.5
 CAPTION_LINE_SPACING_PT = 13.65
 TABLE_SIZE_PT = 10.5
 TABLE_LINE_SPACING_PT = 13.65
+FIGURE_TABLE_STYLE = "FigureTable"
 
 FRONT_MATTER_TITLES = {
     "摘要",
@@ -129,6 +130,7 @@ LEGACY_HEU_STYLE_NAMES = {
     "HEU Cover Small",
 }
 KEEP_CUSTOM_STYLE_NAMES = set(HEU_STYLES.values()) | {
+    FIGURE_TABLE_STYLE,
     "封面宋体小2",
     "封面2号黑体英文论文名称",
     "英文扉页姓名信息",
@@ -1096,14 +1098,34 @@ def _create_reference_numbering(doc: Document) -> int:
         child.set(qn("w:val"), value)
         level.append(child)
     abstract.append(level)
-    numbering.append(abstract)
+
+    # CT_Numbering requires every abstractNum before every num instance.
+    # Appending a new abstractNum after Pandoc's existing num elements creates
+    # invalid OOXML; Word repairs it on save by dropping the Pandoc list
+    # instances, leaving itemize/enumerate paragraphs with dangling numIds.
+    first_instance = next(
+        (
+            child
+            for child in numbering
+            if child.tag in {qn("w:num"), qn("w:numIdMacAtCleanup")}
+        ),
+        None,
+    )
+    if first_instance is None:
+        numbering.append(abstract)
+    else:
+        numbering.insert(numbering.index(first_instance), abstract)
 
     instance = OxmlElement("w:num")
     instance.set(qn("w:numId"), str(num_id))
     abstract_ref = OxmlElement("w:abstractNumId")
     abstract_ref.set(qn("w:val"), str(abstract_id))
     instance.append(abstract_ref)
-    numbering.append(instance)
+    cleanup = numbering.find(qn("w:numIdMacAtCleanup"))
+    if cleanup is None:
+        numbering.append(instance)
+    else:
+        numbering.insert(numbering.index(cleanup), instance)
     return num_id
 
 
@@ -1194,6 +1216,8 @@ def _format_sections(doc: Document) -> None:
 
 def _format_styles(doc: Document) -> None:
     styles = doc.styles
+    if FIGURE_TABLE_STYLE not in styles:
+        styles.add_style(FIGURE_TABLE_STYLE, WD_STYLE_TYPE.TABLE)
     _style(doc, HEU_STYLES["body"])
     _style(doc, HEU_STYLES["body_inline_math"], HEU_STYLES["body"])
     _style(doc, HEU_STYLES["chapter"], "Heading 1")
@@ -1261,10 +1285,11 @@ def _format_styles(doc: Document) -> None:
         space_after_pt=0,
     )
     _set_style_font(styles[HEU_STYLES["body_inline_math"]], "宋体", "Times New Roman", BODY_SIZE_PT, False)
-    _set_style_single_line_layout(
+    _set_style_exact_line_layout(
         styles[HEU_STYLES["body_inline_math"]],
         alignment=WD_ALIGN_PARAGRAPH.JUSTIFY,
         first_line_indent_pt=FIRST_LINE_INDENT_PT,
+        line_spacing_pt=BODY_LINE_SPACING_PT,
         space_before_pt=0,
         space_after_pt=0,
     )
@@ -2590,10 +2615,51 @@ def _clear_table_borders(table) -> None:
             tc_pr.append(tc_borders)
 
 
-def _format_tables(doc: Document) -> None:
-    for table in doc.tables:
+def _table_has_content(table) -> bool:
+    if any((node.text or "").strip() for node in table._tbl.iter(qn("w:t"))):
+        return True
+    return any(
+        table._tbl.find(".//" + qn(tag)) is not None
+        for tag in ("w:drawing", "w:pict", "w:object", "m:oMath", "w:altChunk")
+    )
+
+
+def _is_figure_caption_element(element, parent) -> bool:
+    if element is None or element.tag != qn("w:p"):
+        return False
+    paragraph = Paragraph(element, parent)
+    style_name = paragraph.style.name if paragraph.style else ""
+    return style_name == HEU_STYLES["caption"] and bool(
+        re.match(r"^图\s*\d+(?:\.\d+)+", paragraph.text.strip())
+    )
+
+
+def _is_figure_layout_table(table) -> bool:
+    style_name = table.style.name if table.style else ""
+    if style_name == FIGURE_TABLE_STYLE:
+        return True
+    if table._tbl.find(".//" + qn("w:drawing")) is not None:
+        return True
+    return _is_figure_caption_element(table._tbl.getprevious(), table._parent) or (
+        _is_figure_caption_element(table._tbl.getnext(), table._parent)
+    )
+
+
+def _format_tables(doc: Document, report: ConversionReport | None = None) -> None:
+    removed_empty_figure_tables = 0
+    for table in list(doc.tables):
         table_text = "\n".join(cell.text for row in table.rows for cell in row.cells)
-        if "<w:drawing" in table._tbl.xml or "<wp:inline" in table._tbl.xml:
+        if _is_figure_layout_table(table):
+            if not _table_has_content(table):
+                parent = table._tbl.getparent()
+                if parent is not None:
+                    parent.remove(table._tbl)
+                    removed_empty_figure_tables += 1
+                continue
+            try:
+                table.style = FIGURE_TABLE_STYLE
+            except KeyError:
+                pass
             _clear_table_borders(table)
             table.alignment = WD_TABLE_ALIGNMENT.CENTER
             for row in table.rows:
@@ -2631,6 +2697,8 @@ def _format_tables(doc: Document) -> None:
                     )
                     for run in para.runs:
                         _set_run_font(run, "宋体", "Times New Roman", TABLE_SIZE_PT, None)
+    if report and removed_empty_figure_tables:
+        report.note(f"已删除空图片布局表 {removed_empty_figure_tables} 个。")
 
 
 def postprocess_docx(
@@ -2647,7 +2715,7 @@ def postprocess_docx(
     _format_paragraphs(doc, report)
     equation_numbers = _number_equations(doc, report)
     _replace_equation_reference_placeholders(doc, equation_numbers, report)
-    _format_tables(doc)
+    _format_tables(doc, report)
     _insert_page_section_breaks(doc, report)
     _convert_images_to_top_bottom_wrap(doc, report)
     _keep_figures_with_captions(doc, report)

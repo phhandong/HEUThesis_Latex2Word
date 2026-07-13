@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import re
 import base64
+import hashlib
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from .eps_fallback import convert_imagemagick_eps_to_png
 from .latex_parser import ExpandedLatexProject, ThesisMetadata
 
 COVER_MARKER = "HEU_COVER_PLACEHOLDER"
@@ -16,6 +19,12 @@ EQUATION_MARKER_RE = re.compile(
 EQUATION_REF_PLACEHOLDER_RE = re.compile(
     r"HEU_EQREF_(PLAIN|PAREN)_([A-Za-z0-9_-]+?)_END"
 )
+
+
+@dataclass
+class GraphicsFallbackReport:
+    converted_eps: list[tuple[Path, Path]] = field(default_factory=list)
+    unresolved_eps: list[Path] = field(default_factory=list)
 
 _VERBATIM_BLOCK_RE = re.compile(
     r"\\begin\{(?P<env>lstlisting|verbatim|Verbatim|minted)\}.*?"
@@ -317,25 +326,101 @@ def _neutralize_heu_macros(text: str, metadata: ThesisMetadata, include_auth_sca
     return _replace_citations(text)
 
 
-def _resolve_graphics_extensions(text: str, resource_paths: list[Path]) -> str:
-    preferred_suffixes = [".png", ".jpg", ".jpeg", ".pdf", ".eps"]
+def _find_graphic(name: str, resource_paths: list[Path]) -> Path | None:
+    path = Path(name)
+    if path.is_absolute() and path.exists():
+        return path
+    for base in resource_paths:
+        candidate = base / path
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _existing_eps_fallback(source: Path) -> Path | None:
+    for suffix in (".png", ".jpg", ".jpeg", ".svg"):
+        candidate = source.with_suffix(suffix)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _generated_eps_fallback(
+    source: Path,
+    generated_assets_dir: Path | None,
+    graphics_report: GraphicsFallbackReport | None,
+) -> Path | None:
+    existing = _existing_eps_fallback(source)
+    if existing is not None:
+        return existing
+    if generated_assets_dir is None:
+        return None
+
+    digest = hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()[:12]
+    target = generated_assets_dir / f"{source.stem}-{digest}.png"
+    if target.exists() or convert_imagemagick_eps_to_png(source, target):
+        if graphics_report is not None and (source, target) not in graphics_report.converted_eps:
+            graphics_report.converted_eps.append((source, target))
+        return target
+    if graphics_report is not None and source not in graphics_report.unresolved_eps:
+        graphics_report.unresolved_eps.append(source)
+    return None
+
+
+def _resolve_graphics_extensions(
+    text: str,
+    resource_paths: list[Path],
+    *,
+    generated_assets_dir: Path | None = None,
+    graphics_report: GraphicsFallbackReport | None = None,
+) -> str:
+    preferred_suffixes = (".png", ".jpg", ".jpeg", ".svg", ".pdf")
 
     def replace(match: re.Match[str]) -> str:
         options = match.group(1) or ""
         name = match.group(2)
-        if Path(name).suffix:
+        source_name = Path(name)
+        if source_name.suffix and source_name.suffix.lower() != ".eps":
             return match.group(0)
+
+        if source_name.suffix.lower() == ".eps":
+            source = _find_graphic(name, resource_paths)
+            if source is None:
+                return match.group(0)
+            fallback = _generated_eps_fallback(source, generated_assets_dir, graphics_report)
+            if fallback is None:
+                return match.group(0)
+            return rf"\includegraphics{options}{{{fallback.resolve().as_posix()}}}"
+
         for base in resource_paths:
             for suffix in preferred_suffixes:
                 candidate = base / f"{name}{suffix}"
                 if candidate.exists():
                     return rf"\includegraphics{options}{{{name}{suffix}}}"
+            candidate = base / f"{name}.eps"
+            if not candidate.exists():
+                continue
+            fallback = _generated_eps_fallback(candidate, generated_assets_dir, graphics_report)
+            if fallback is not None:
+                return rf"\includegraphics{options}{{{fallback.resolve().as_posix()}}}"
+            return rf"\includegraphics{options}{{{name}.eps}}"
         return match.group(0)
 
     return re.sub(r"\\includegraphics(\[[^\]]*\])?\{([^{}]+)\}", replace, text)
 
 
-def make_pandoc_latex(project: ExpandedLatexProject, include_auth_scan: Path | None = None) -> str:
-    text = _resolve_graphics_extensions(project.latex, project.resource_paths)
+def make_pandoc_latex(
+    project: ExpandedLatexProject,
+    include_auth_scan: Path | None = None,
+    *,
+    generated_assets_dir: Path | None = None,
+    graphics_report: GraphicsFallbackReport | None = None,
+) -> str:
+    text = _resolve_graphics_extensions(
+        project.latex,
+        project.resource_paths,
+        generated_assets_dir=generated_assets_dir,
+        graphics_report=graphics_report,
+    )
     text = _neutralize_heu_macros(text, project.metadata, include_auth_scan)
     return _prepare_pandoc_math(text)
